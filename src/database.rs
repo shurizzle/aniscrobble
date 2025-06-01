@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub type U64 = heed::types::U64<heed::byteorder::LittleEndian>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Delayed<T>(Arc<Mutex<Option<T>>>);
 
 impl<T> Delayed<T> {
@@ -40,7 +40,7 @@ impl AsRef<User> for User {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Database {
     env: heed::Env,
     main: heed::Database<Str, Bytes>,
@@ -188,6 +188,17 @@ pub struct SyncContext<'a> {
     pending: Vec<u64>,
     db: &'a Database,
     idx: usize,
+}
+
+impl std::fmt::Debug for SyncContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncContext")
+            .field("changed", &self.changed)
+            .field("pending", &self.pending)
+            .field("db", &self.db)
+            .field("idx", &self.idx)
+            .finish()
+    }
 }
 
 pub struct Anime<'a> {

@@ -3,10 +3,10 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 use api::Api;
 use clap::{Parser, Subcommand};
-use daemon::daemonize;
 use database::{Database, User};
 
 mod api;
+#[cfg(not(windows))]
 mod daemon;
 mod database;
 
@@ -14,7 +14,7 @@ pub trait IsFatal {
     fn is_fatal(&self) -> bool;
 }
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version, about, long_about)]
 #[command(propagate_version = true)]
 struct Cli {
@@ -22,7 +22,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
     Login {
         /// force login even if already logged in
@@ -148,15 +148,37 @@ fn scrobble(
         }
     }
 
-    match daemonize()? {
-        daemon::Whoami::Child => Ok(Some(Cli {
-            command: Commands::Sync,
-        })),
-        daemon::Whoami::Parent(res) => {
-            if res {
-                Ok(None)
-            } else {
-                bail!("The process could not be cloned");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x8000000;
+        const DETACHED_PROCESS: u32 = 8;
+
+        std::process::Command::new(std::env::current_exe().context("Cannot spawn sync task")?)
+            .arg("sync")
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .spawn()
+            .context("Cannot spawn sync task")?;
+        Ok(None)
+    }
+
+    #[cfg(not(windows))]
+    {
+        match unsafe { daemon::daemonize()? } {
+            daemon::Whoami::Child => Ok(Some(Cli {
+                command: Commands::Sync,
+            })),
+
+            daemon::Whoami::Parent(res) => {
+                if res {
+                    Ok(None)
+                } else {
+                    bail!("The process could not be cloned");
+                }
             }
         }
     }
