@@ -90,7 +90,7 @@ pub enum MediaListStatus {
 
 #[derive(Debug)]
 pub struct Anime {
-    pub episodes: u64,
+    pub episodes: Option<u64>,
     pub progress: u64,
 }
 
@@ -143,10 +143,10 @@ impl Api {
         .map(|v| v.Viewer.id)
     }
 
-    fn _get_anime(&self, id: u64) -> Result<u64, ureq::Error> {
+    fn _get_anime(&self, id: u64) -> Result<Option<u64>, ureq::Error> {
         #[derive(Deserialize)]
         struct Media {
-            episodes: u64,
+            episodes: Option<u64>,
         }
 
         #[derive(Deserialize)]
@@ -212,7 +212,7 @@ impl Api {
         token: &str,
         id: u64,
         progress: u64,
-        total: u64,
+        total: Option<u64>,
     ) -> Result<u64, ureq::Error> {
         #[derive(Deserialize)]
         struct SaveMediaListEntry {
@@ -239,7 +239,11 @@ impl Api {
                 .add("progress", &progress)?
                 .add(
                     "status",
-                    &if progress == total {
+                    &if total
+                        .as_ref()
+                        .map(|total| progress == *total)
+                        .unwrap_or(false)
+                    {
                         MediaListStatus::Completed
                     } else {
                         MediaListStatus::Current
