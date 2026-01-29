@@ -1,9 +1,8 @@
-use std::io::Write;
-
 use anyhow::{Context, Result, bail};
 use api::Api;
 use clap::{Parser, Subcommand};
 use database::{Database, User};
+use rustyline::{DefaultEditor, error::ReadlineError};
 
 mod api;
 #[cfg(not(windows))]
@@ -206,12 +205,23 @@ fn login(force: bool) -> Result<Option<Cli>> {
 
     let mut token = String::new();
     let api = Api::new();
+    let mut rl = DefaultEditor::new()?;
+
     loop {
         loop {
-            token.clear();
-            print!("token> ");
-            std::io::stdout().flush()?;
-            std::io::stdin().read_line(&mut token)?;
+            match rl.readline("token> ") {
+                Ok(line) => {
+                    token = line;
+                }
+                Err(ReadlineError::Interrupted) => {
+                    drop(rl);
+                    std::process::exit(1);
+                }
+                Err(ReadlineError::Eof) => (),
+                Err(err) => {
+                    return Err(err.into());
+                }
+            }
             if token.is_empty() {
                 std::process::exit(1);
             }
