@@ -164,7 +164,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn sync(&self) -> heed::Result<SyncContext> {
+    pub fn sync(&self) -> heed::Result<SyncContext<'_>> {
         let wtxn = self.env.write_txn()?;
         let pending = self
             .main
@@ -223,7 +223,7 @@ impl Drop for Anime<'_> {
 }
 
 impl SyncContext<'_> {
-    pub fn next(&mut self) -> Option<heed::Result<Anime>> {
+    pub fn next(&mut self) -> Option<heed::Result<Anime<'_>>> {
         loop {
             let id = *self.pending.get(self.idx)?;
             let episode = self
@@ -274,10 +274,10 @@ impl SyncContext<'_> {
 impl Drop for SyncContext<'_> {
     fn drop(&mut self) {
         let mut txn = unsafe { std::ptr::read_volatile(&*self.txn) };
-        if self.changed {
-            if let Ok(pending) = bincode::serialize(&self.pending) {
-                _ = self.db.main.put(&mut txn, "pending", &pending);
-            }
+        if self.changed
+            && let Ok(pending) = bincode::serialize(&self.pending)
+        {
+            _ = self.db.main.put(&mut txn, "pending", &pending);
         }
         _ = txn.commit();
     }
