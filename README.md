@@ -5,9 +5,10 @@ AniList progress tracker and terminal catalog browser.
 - `login`, `sync`, `scrobble`: keep episode progress locally and push it to
   AniList. Safe to run offline: local progress is written first, the network
   step is resumable.
-- `tui` (feature `tui`): read-only terminal UI to explore the AniList catalog.
-  Trending, search, full media pages, staff/character pages and real cover art
-  through the terminal image protocol.
+- `tui` (feature `tui`): read-only terminal UI to explore the AniList catalog
+  and, when logged in, your current anime/manga lists. Trending, search, full
+  media pages, staff/character pages and real cover art through the terminal
+  image protocol.
 
 The interesting part of the TUI is not the feature set, it is the execution
 model: the UI never waits for the network. Every request is scoped to the widget
@@ -69,6 +70,44 @@ pending sync is shown immediately even before `sync` runs. Logged out, or for
 media not on your list, those rows are absent. The TUI is read-only: it never
 changes your list.
 
+### My lists
+
+When `aniscrobble login` is present, the TUI starts on one combined page:
+**ANIME IN PROGRESS** followed by **MANGA IN PROGRESS**. Logged out, the default
+and only anonymous source is trending. `m` or `M` reopens my lists, `Tab` returns
+to trending.
+
+Each row shows cover, title, format and `progress / total`; when episodes or
+chapters are available past your progress, the meta line turns yellow and shows
+`+N new`. Local `scrobble` progress wins over a lower AniList value for anime.
+
+Both sections paginate independently, 30 rows per page, infinite scroll, and
+keep the selected row when a page is appended. Opening a row works for anime
+and manga, including detail, characters/staff tabs and cover cache.
+
+### Cache
+
+Every successful GraphQL response except search, plus every cover image, is
+written to the existing LMDB environment (`aniscrobble/data.db`, a dedicated `cache` database),
+next to login and local progress. Keys are semantic: `anime:<id>`,
+`anime:<id>:cover`, `anime:<id>:characters:<page>`, `staff:<id>:<page>`,
+`character:<id>:<page>`, `trending:<page>`, `genre:<name>:<page>`,
+`tag:<name>:<page>`. Logged-in and anonymous sessions share them. Search is
+never cached: it always hits the network and never falls back to an old result.
+
+- Fresh entries are local-first: no request at all. TTLs: trending 15 min, media
+  detail 30 min, credit tabs 12 h, genre/tag browse 24 h, staff/character pages
+  24 h. Covers never expire.
+- **My lists are the exception: network-first.** Every visit requests AniList;
+  the cache is written on success and used only when the request fails.
+- Once the TTL expires the entry is fetched again. If the request fails, the
+  stale entry is still used, so pages already visited remain readable offline.
+- A page never visited has no cached entry and shows its normal error with retry.
+
+This is not an offline mode: there is no prefetch. Only data already fetched is
+available. The cache is also unbounded: no eviction, and the LMDB map is capped
+at 1 GiB.
+
 ### Screenshots
 
 Trending list:
@@ -83,6 +122,7 @@ Media page, with cover, metadata, tags, relations and character thumbnails:
 
 | Key | Action |
 | --- | --- |
+| `m` / `M` | List: my current anime and manga (logged in) |
 | `j` / `k` / `↓` / `↑` | Move selection |
 | `g` / `G` | First / last loaded item |
 | `Enter` | List: open the media page. Media page: follow the focused link (media, genre, tag, staff) |

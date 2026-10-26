@@ -98,8 +98,8 @@ relations and recommendations. Fetched only when a media page opens, and again
 when a related entry is clicked.
 
 ```graphql
-query Detail($id: Int) {
-  Media(id: $id, type: ANIME) {
+query Detail($id: Int, $type: MediaType) {
+  Media(id: $id, type: $type) {
     # ...the full field set used by the list query...
     mediaListEntry {
       status
@@ -320,6 +320,44 @@ query {
   Viewer { id }
 }
 ```
+
+## Current lists
+
+The home screen lists the viewer's in-progress entries through `Page.mediaList`.
+`userId` is the id stored at login, `type` is `ANIME` or `MANGA`, and
+`status: CURRENT` keeps the query to the two sections AniList shows.
+
+```graphql
+query MyList($userId: Int, $type: MediaType, $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage }
+    mediaList(
+      userId: $userId
+      type: $type
+      status: CURRENT
+      sort: UPDATED_TIME_DESC
+    ) {
+      progress
+      media {
+        id
+        type
+        title { romaji english }
+        coverImage { large extraLarge }
+        format
+        episodes
+        chapters
+        status
+        nextAiringEpisode { episode }
+      }
+    }
+  }
+}
+```
+
+`nextAiringEpisode.episode` is the next episode to air, so `episode - 1` is what
+is already available. Finished media fall back to `episodes` (anime) or
+`chapters` (manga). There is no equivalent "next chapter" field, so an ongoing
+manga cannot report new chapters reliably; only finished manga use `chapters`.
 
 ## Sync queries
 

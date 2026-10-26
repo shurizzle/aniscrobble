@@ -5,7 +5,8 @@ use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui_image::Image;
 
-use crate::tui::app::{App, LIST_COVER};
+use crate::tui::app::{App, LIST_COVER, Source};
+use crate::tui::model::{Media, MediaKind};
 use crate::tui::ui::text::{plain_text, truncate};
 
 const GAP: u16 = 1;
@@ -17,6 +18,7 @@ struct Row {
     meta: String,
     plot: String,
     url: Option<String>,
+    new: bool,
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
@@ -42,19 +44,30 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|idx| {
             let media = &app.items[idx];
             let mut meta: Vec<String> = Vec::new();
-            if let Some(year) = media.season_year {
-                meta.push(year.to_string());
+            let mut new = false;
+
+            if let Source::Mine = &app.source {
+                let kind = media.kind;
+                let progress = app.my_progress(media.id, kind).unwrap_or(0);
+                meta.push(mine_meta(media, progress, kind));
+                new = media
+                    .available(kind)
+                    .is_some_and(|available| available > progress);
+            } else {
+                if let Some(year) = media.season_year {
+                    meta.push(year.to_string());
+                }
+                if let Some(format) = &media.format {
+                    meta.push(format.clone());
+                }
+                if let Some(episodes) = media.episodes {
+                    meta.push(format!("{episodes} ep"));
+                }
+                if let Some(score) = media.average_score {
+                    meta.push(format!("★{score}"));
+                }
+                meta.extend(media.genres.iter().cloned());
             }
-            if let Some(format) = &media.format {
-                meta.push(format.clone());
-            }
-            if let Some(episodes) = media.episodes {
-                meta.push(format!("{episodes} ep"));
-            }
-            if let Some(score) = media.average_score {
-                meta.push(format!("★{score}"));
-            }
-            meta.extend(media.genres.iter().cloned());
 
             Row {
                 idx,
@@ -67,23 +80,48 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     .map(plain_text)
                     .unwrap_or_else(|| "no synopsis".to_string()),
                 url: media.cover_url().map(str::to_string),
+                new,
             }
         })
         .collect();
 
     let text_width = area.width - LIST_COVER.0 - 1;
+    let headers = app.list_headers().to_vec();
+    let mut y = area.y;
 
-    for (n, row) in rows.iter().enumerate() {
-        let y = area.y + n as u16 * row_h;
+    for row in &rows {
+        if let Some((_, label)) = headers.iter().find(|(index, _)| *index == row.idx) {
+            if y + 1 > area.bottom() {
+                break;
+            }
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" {label}"),
+                    Style::new()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Rect::new(area.x, y, area.width, 1),
+            );
+            y += 1;
+        }
         if y + LIST_COVER.1 > area.bottom() {
             break;
         }
 
         let image_area = Rect::new(area.x, y, LIST_COVER.0, LIST_COVER.1);
-        let proto = row
-            .url
-            .as_deref()
-            .and_then(|url| app.cover(url, LIST_COVER.0, LIST_COVER.1));
+        let kind = app
+            .items
+            .get(row.idx)
+            .map_or(MediaKind::Anime, |media| media.kind);
+        let proto = row.url.as_deref().and_then(|url| {
+            app.cover(
+                &format!("{}:{}:cover", kind.label(), row.id),
+                url,
+                LIST_COVER.0,
+                LIST_COVER.1,
+            )
+        });
 
         match proto {
             Some(proto) => {
@@ -128,7 +166,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 truncate(&row.meta, text_width as usize),
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(if row.new { Color::Yellow } else { Color::Cyan }),
             )),
             Rect::new(text_x, y + 1, text_width, 1),
         );
@@ -142,7 +180,26 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 Rect::new(text_x, y + 2, text_width, plot_height),
             );
         }
+        y += row_h;
     }
+}
+
+fn mine_meta(media: &Media, progress: i64, kind: MediaKind) -> String {
+    let mut parts = Vec::new();
+    if let Some(format) = &media.format {
+        parts.push(format.clone());
+    }
+    parts.push(match media.total(kind) {
+        Some(total) => format!("{progress} / {total}"),
+        None => progress.to_string(),
+    });
+    if let Some(available) = media
+        .available(kind)
+        .filter(|available| *available > progress)
+    {
+        parts.push(format!("+{} new", available - progress));
+    }
+    parts.join(" · ")
 }
 
 fn draw_empty(f: &mut Frame, app: &App, area: Rect) {
@@ -185,8 +242,9 @@ mod tests {
     use ratatui_image::picker::Picker;
     use tokio::sync::mpsc;
 
+    use super::mine_meta;
     use crate::tui::app::App;
-    use crate::tui::model::{Media, Title};
+    use crate::tui::model::{AiringEpisode, Media, MediaKind, Title};
 
     fn sample(title: &str, id: i64) -> Media {
         Media {
@@ -197,6 +255,35 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn my_list_meta_shows_progress_and_new_episodes() {
+        let mut media = sample("Show", 1);
+        media.format = Some("TV".into());
+        media.episodes = Some(12);
+        media.status = Some("RELEASING".into());
+        media.next_airing_episode = Some(AiringEpisode { episode: 6 });
+
+        assert_eq!(
+            mine_meta(&media, 4, MediaKind::Anime),
+            "TV · 4 / 12 · +1 new"
+        );
+        assert_eq!(mine_meta(&media, 5, MediaKind::Anime), "TV · 5 / 12");
+
+        media.next_airing_episode = None;
+        media.status = Some("FINISHED".into());
+        assert_eq!(
+            mine_meta(&media, 11, MediaKind::Anime),
+            "TV · 11 / 12 · +1 new"
+        );
+
+        media.kind = MediaKind::Manga;
+        media.chapters = Some(30);
+        assert_eq!(
+            mine_meta(&media, 12, MediaKind::Manga),
+            "TV · 12 / 30 · +18 new"
+        );
     }
 
     #[tokio::test]

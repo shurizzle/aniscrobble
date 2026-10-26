@@ -1,4 +1,5 @@
 mod app;
+mod cache;
 mod model;
 mod net;
 mod term;
@@ -25,8 +26,8 @@ pub async fn run() -> Result<()> {
     // the terminal in its normal state: do it before entering raw mode.
     let picker = Arc::new(build_picker());
     let (tx, mut rx) = mpsc::channel::<NetMsg>(64);
-    let (token, progress) = stored_account();
-    let mut app = App::with_account(picker, tx, token, progress);
+    let (db, token, viewer, progress) = stored_account();
+    let mut app = App::with_account(picker, tx, db, token, viewer, progress);
 
     let mut terminal = term::init();
     let mut events = EventStream::new();
@@ -76,11 +77,18 @@ async fn event_loop(
     Ok(())
 }
 
-fn stored_account() -> (Option<String>, HashMap<i64, i64>) {
+fn stored_account() -> (
+    Option<crate::database::Database>,
+    Option<String>,
+    Option<u64>,
+    HashMap<i64, i64>,
+) {
     let Some(db) = crate::database::Database::new().ok() else {
-        return (None, HashMap::new());
+        return (None, None, None, HashMap::new());
     };
-    let token = db.login().ok().flatten().map(|user| user.token);
+    let login = db.login().ok().flatten();
+    let viewer = login.as_ref().map(|user| user.id);
+    let token = login.map(|user| user.token);
     let progress = db
         .progresses()
         .map(|progress| {
@@ -90,7 +98,7 @@ fn stored_account() -> (Option<String>, HashMap<i64, i64>) {
                 .collect()
         })
         .unwrap_or_default();
-    (token, progress)
+    (Some(db), token, viewer, progress)
 }
 
 fn build_picker() -> Picker {

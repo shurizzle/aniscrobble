@@ -10,7 +10,9 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use tokio::sync::mpsc;
 
-use crate::tui::model::{Credit, CreditKind, Media, MediaDetail, PersonKind, PersonPageData};
+use crate::tui::model::{
+    Credit, CreditKind, Media, MediaDetail, MediaKind, MyListEntry, PersonKind, PersonPageData,
+};
 use crate::tui::net::{Job, Net, NetMsg, ReqKey, ScopeId};
 
 pub type CoverKey = (String, u16, u16);
@@ -48,6 +50,47 @@ pub enum Source {
     Search(String),
     Genre(String),
     Tag(String),
+    /// The viewer's current anime and manga lists on one page.
+    Mine,
+}
+
+/// One paginated section of the viewer's current list.
+#[derive(Debug, Default)]
+pub struct MineSection {
+    pub items: Vec<MyListEntry>,
+    pub page: u32,
+    pub has_next: bool,
+    pub loading: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct MineLists {
+    pub anime: MineSection,
+    pub manga: MineSection,
+}
+
+impl MineLists {
+    fn section(&self, kind: MediaKind) -> &MineSection {
+        match kind {
+            MediaKind::Anime => &self.anime,
+            MediaKind::Manga => &self.manga,
+        }
+    }
+
+    fn section_mut(&mut self, kind: MediaKind) -> &mut MineSection {
+        match kind {
+            MediaKind::Anime => &mut self.anime,
+            MediaKind::Manga => &mut self.manga,
+        }
+    }
+
+    fn loading(&self) -> bool {
+        self.anime.loading || self.manga.loading
+    }
+
+    fn has_next(&self) -> bool {
+        self.anime.has_next || self.manga.has_next
+    }
 }
 
 impl Source {
@@ -57,6 +100,7 @@ impl Source {
             Source::Search(query) => format!("search \"{query}\""),
             Source::Genre(genre) => format!("genre \"{genre}\""),
             Source::Tag(tag) => format!("tag \"{tag}\""),
+            Source::Mine => "in progress".into(),
         }
     }
 }
@@ -150,6 +194,16 @@ pub struct App {
     pub detail_data: Option<MediaDetail>,
     /// Episode reached locally, including progress not synced to AniList yet.
     local_progress: HashMap<i64, i64>,
+    /// Progress from the viewer's AniList list, keyed by media id.
+    my_progress: HashMap<i64, i64>,
+    /// Current anime and manga sections, loaded page by page.
+    mine: MineLists,
+    /// Both first pages have landed at least once for the current source.
+    mine_ready: bool,
+    /// Section headers for the combined current-list page: item index -> label.
+    list_headers: Vec<(usize, String)>,
+    /// Logged-in AniList user id. `None` disables the current list.
+    viewer: Option<u64>,
     /// Media currently shown by the page, possibly not loaded in full yet.
     pub page_subject: Option<Media>,
     /// Previously visited pages, most recent last. `Backspace` pops it.
@@ -179,23 +233,30 @@ pub struct App {
 impl App {
     #[cfg(test)]
     pub fn new(picker: Arc<Picker>, tx: mpsc::Sender<NetMsg>) -> Self {
-        Self::with_account(picker, tx, None, HashMap::new())
+        Self::with_account(picker, tx, None, None, None, HashMap::new())
     }
 
     pub fn with_account(
         picker: Arc<Picker>,
         tx: mpsc::Sender<NetMsg>,
+        db: Option<crate::database::Database>,
         token: Option<String>,
+        viewer: Option<u64>,
         local_progress: HashMap<i64, i64>,
     ) -> Self {
         let protocol = format!("{:?}", picker.protocol_type()).to_lowercase();
-        let mut net = Net::with_token(picker, tx, token);
+        let mut net = Net::with_account(picker, tx, token, db);
         let scope = net.mount();
 
+        let source = if viewer.is_some() {
+            Source::Mine
+        } else {
+            Source::Trending
+        };
         let mut app = Self {
             running: true,
             dirty: true,
-            source: Source::Trending,
+            source,
             items: Vec::new(),
             selected: 0,
             page: 1,
@@ -219,6 +280,11 @@ impl App {
             browse_origin: None,
             detail_data: None,
             local_progress,
+            my_progress: HashMap::new(),
+            mine: MineLists::default(),
+            mine_ready: false,
+            list_headers: Vec::new(),
+            viewer,
             page_subject: None,
             page_history: Vec::new(),
             page_links: Vec::new(),
@@ -509,9 +575,10 @@ impl App {
     }
 
     fn request_credits(&mut self, kind: CreditKind, page: u32) {
-        let Some(id) = self.page_media().map(|media| media.id) else {
+        let Some(media) = self.page_media() else {
             return;
         };
+        let (id, media_kind) = (media.id, media.kind);
         let Some(scope) = self.detail_scope else {
             return;
         };
@@ -522,6 +589,7 @@ impl App {
             ReqKey::Credits(kind, page),
             Job::Credits {
                 kind,
+                media_kind,
                 id,
                 page,
                 per_page: CREDITS_PER_PAGE,
@@ -781,6 +849,7 @@ impl App {
             }
             KeyCode::Tab => self.toggle_source(),
             KeyCode::Char('r') => self.refetch(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.open_mine(),
             KeyCode::Backspace => self.back_from_browse(),
             _ => {}
         }
@@ -872,8 +941,11 @@ impl App {
         self.detail_scope = Some(scope);
         self.net.request(
             scope,
-            ReqKey::Detail(media.id),
-            Job::Detail { id: media.id },
+            ReqKey::Detail(media.kind, media.id),
+            Job::Detail {
+                id: media.id,
+                kind: media.kind,
+            },
         );
     }
 
@@ -924,6 +996,10 @@ impl App {
         if self.selected + PREFETCH_AHEAD < self.items.len() {
             return;
         }
+        if matches!(self.source, Source::Mine) {
+            self.prefetch_mine();
+            return;
+        }
         self.page += 1;
         self.request_page();
     }
@@ -938,6 +1014,99 @@ impl App {
         self.browse_origin = None;
         self.page = 1;
         self.refetch();
+    }
+
+    fn open_mine(&mut self) {
+        if self.viewer.is_none() {
+            // Anonymous sessions have no personal lists: stay on trending.
+            if !matches!(self.source, Source::Trending) {
+                self.source = Source::Trending;
+                self.page = 1;
+                self.refetch();
+            }
+            return;
+        }
+        if matches!(self.source, Source::Mine) {
+            return;
+        }
+        self.source = Source::Mine;
+        self.browse_origin = None;
+        self.page = 1;
+        self.refetch();
+    }
+
+    fn request_mine(&mut self, kind: MediaKind, page: u32) {
+        let Some(user_id) = self.viewer else {
+            return;
+        };
+        if self.mine.section(kind).loading {
+            return;
+        }
+        let scope = self.scope;
+        self.mine.section_mut(kind).loading = true;
+        self.list_loading = true;
+        self.dirty = true;
+        self.net.request(
+            scope,
+            ReqKey::Mine(kind, page),
+            Job::Mine {
+                kind,
+                user_id,
+                page,
+                per_page: PER_PAGE,
+            },
+        );
+    }
+
+    fn prefetch_mine(&mut self) {
+        let mut next = Vec::new();
+        for kind in [MediaKind::Anime, MediaKind::Manga] {
+            let section = self.mine.section(kind);
+            if section.has_next && !section.loading {
+                next.push((kind, section.page + 1));
+            }
+        }
+        for (kind, page) in next {
+            self.request_mine(kind, page);
+        }
+    }
+
+    fn rebuild_mine(&mut self) {
+        let selected = self.items.get(self.selected).map(|media| media.id);
+        let anime = self.mine.anime.items.clone();
+        let manga = self.mine.manga.items.clone();
+        // Before both first pages land, one section can arrive alone; that must
+        // not move the focus to the first manga row.
+        let ready = self.mine.anime.page > 0 && self.mine.manga.page > 0;
+        let keep_selection = self.mine_ready && ready;
+
+        self.items.clear();
+        self.my_progress.clear();
+        self.list_headers.clear();
+        if !anime.is_empty() {
+            self.list_headers.push((0, "ANIME IN PROGRESS".into()));
+        }
+        for entry in anime {
+            self.my_progress.insert(entry.media.id, entry.progress);
+            self.items.push(entry.media);
+        }
+        if !manga.is_empty() {
+            self.list_headers
+                .push((self.items.len(), "MANGA IN PROGRESS".into()));
+        }
+        for entry in manga {
+            self.my_progress.insert(entry.media.id, entry.progress);
+            self.items.push(entry.media);
+        }
+        self.has_next = self.mine.has_next();
+        self.selected = if keep_selection {
+            selected
+                .and_then(|id| self.items.iter().position(|media| media.id == id))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.mine_ready = ready;
     }
 
     fn schedule_search(&mut self) {
@@ -969,6 +1138,10 @@ impl App {
         self.pending_covers.clear();
         self.failed_covers.clear();
         self.items.clear();
+        self.my_progress.clear();
+        self.mine = MineLists::default();
+        self.mine_ready = false;
+        self.list_headers.clear();
         self.selected = 0;
         self.page = 1;
         self.error = None;
@@ -1028,6 +1201,10 @@ impl App {
                     },
                 );
             }
+            Source::Mine => {
+                self.request_mine(MediaKind::Anime, 1);
+                self.request_mine(MediaKind::Manga, 1);
+            }
         }
     }
 
@@ -1052,6 +1229,32 @@ impl App {
                     self.items.extend(items);
                 }
                 self.selected = self.selected.min(self.items.len().saturating_sub(1));
+                self.error = None;
+                self.dirty = true;
+            }
+            NetMsg::Mine {
+                scope,
+                req,
+                kind,
+                page,
+                items,
+                has_next,
+            } => {
+                if scope != self.scope || !self.net.is_current(scope, req) {
+                    return;
+                }
+                self.net.done(scope, req);
+                let section = self.mine.section_mut(kind);
+                section.loading = false;
+                section.has_next = has_next;
+                section.page = page;
+                if page <= 1 {
+                    section.items = items;
+                } else {
+                    section.items.extend(items);
+                }
+                self.list_loading = self.mine.loading();
+                self.rebuild_mine();
                 self.error = None;
                 self.dirty = true;
             }
@@ -1163,7 +1366,13 @@ impl App {
                         self.pending_covers.remove(&(url.clone(), w, h));
                         self.failed_covers.insert((url, w, h));
                     }
-                    ReqKey::Detail(_) => {
+                    ReqKey::Mine(kind, _) => {
+                        self.mine.section_mut(kind).loading = false;
+                        self.list_loading = self.mine.loading();
+                        self.detail_error = None;
+                        self.error = Some(err);
+                    }
+                    ReqKey::Detail(_, _) => {
                         self.detail_loading = false;
                         self.detail_error = Some(err);
                     }
@@ -1211,29 +1420,31 @@ impl App {
     }
 
     /// Cached cover for `url`, or `None` while it loads. Requests the cover on
-    /// first sight; the request belongs to the current scope.
-    pub fn cover(&mut self, url: &str, w: u16, h: u16) -> Option<Arc<Protocol>> {
-        let key = (url.to_string(), w, h);
-        if let Some(proto) = self.covers.get(&key) {
+    /// first sight; the request belongs to the current scope. `key` is the
+    /// semantic disk-cache key, e.g. `anime:21:cover`.
+    pub fn cover(&mut self, key: &str, url: &str, w: u16, h: u16) -> Option<Arc<Protocol>> {
+        let cache_key = (url.to_string(), w, h);
+        if let Some(proto) = self.covers.get(&cache_key) {
             return Some(proto.clone());
         }
         // No live scope means the view is being replaced: do not start work.
-        if self.failed_covers.contains(&key) || !self.net.is_live(self.scope) {
+        if self.failed_covers.contains(&cache_key) || !self.net.is_live(self.scope) {
             return None;
         }
-        if self.pending_covers.insert(key.clone()) {
+        if self.pending_covers.insert(cache_key.clone()) {
             let scope = self.scope;
             self.net.request(
                 scope,
                 ReqKey::Cover {
-                    url: key.0.clone(),
+                    url: cache_key.0.clone(),
                     w,
                     h,
                 },
                 Job::Cover {
-                    url: key.0.clone(),
+                    url: cache_key.0.clone(),
                     w,
                     h,
+                    key: key.to_string(),
                 },
             );
         }
@@ -1283,6 +1494,20 @@ impl App {
     /// as the truth when it is greater than the remote progress.
     pub fn local_progress(&self, id: i64) -> Option<i64> {
         self.local_progress.get(&id).copied()
+    }
+
+    /// Progress shown for a current-list row. Local episode wins for anime.
+    pub fn my_progress(&self, id: i64, kind: MediaKind) -> Option<i64> {
+        let remote = self.my_progress.get(&id).copied()?;
+        if kind != MediaKind::Anime {
+            return Some(remote);
+        }
+        Some(self.local_progress(id).unwrap_or(remote).max(remote))
+    }
+
+    /// Section headers for the current list: `(item index, label)`.
+    pub fn list_headers(&self) -> &[(usize, String)] {
+        &self.list_headers
     }
 
     #[cfg(test)]
@@ -1363,10 +1588,12 @@ impl App {
 mod tests {
     use std::sync::Arc;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui_image::picker::Picker;
     use tokio::sync::mpsc;
 
     use super::{App, Source};
+    use crate::tui::model::MediaKind;
 
     fn app() -> App {
         let (tx, _rx) = mpsc::channel(8);
@@ -1378,6 +1605,97 @@ mod tests {
             id,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn anonymous_sessions_stay_on_trending() {
+        let mut app = app();
+        assert_eq!(app.source, Source::Trending);
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('m')));
+        assert_eq!(app.source, Source::Trending);
+        app.on_key(key(KeyCode::Char('M')));
+        assert_eq!(app.source, Source::Trending);
+
+        app.source = Source::Genre("Action".into());
+        app.on_key(key(KeyCode::Char('m')));
+        assert_eq!(app.source, Source::Trending);
+    }
+
+    #[tokio::test]
+    async fn logged_in_sessions_default_to_my_lists() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = App::with_account(
+            Arc::new(Picker::halfblocks()),
+            tx,
+            None,
+            None,
+            Some(7),
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(app.source, Source::Mine);
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(key(KeyCode::Char('m')));
+        assert_eq!(app.source, Source::Mine);
+        app.on_key(key(KeyCode::Char('M')));
+        assert_eq!(app.source, Source::Mine);
+    }
+
+    #[tokio::test]
+    async fn my_lists_combine_anime_and_manga_with_headers() {
+        use crate::tui::model::MyListEntry;
+
+        let mut app = app();
+        let mut manga = media(2);
+        manga.kind = MediaKind::Manga;
+        app.mine.anime.items = vec![MyListEntry {
+            media: media(1),
+            progress: 3,
+        }];
+        app.mine.manga.items = vec![MyListEntry {
+            media: manga,
+            progress: 5,
+        }];
+
+        app.rebuild_mine();
+
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(
+            app.list_headers(),
+            &[
+                (0, "ANIME IN PROGRESS".to_string()),
+                (1, "MANGA IN PROGRESS".to_string()),
+            ]
+        );
+        assert_eq!(app.my_progress(1, MediaKind::Anime), Some(3));
+        assert_eq!(app.my_progress(2, MediaKind::Manga), Some(5));
+    }
+
+    #[tokio::test]
+    async fn manga_arriving_first_does_not_take_focus() {
+        use crate::tui::model::MyListEntry;
+
+        let mut app = app();
+        let mut manga = media(2);
+        manga.kind = MediaKind::Manga;
+        app.mine.manga.items = vec![MyListEntry {
+            media: manga,
+            progress: 1,
+        }];
+        app.mine.manga.page = 1;
+        app.rebuild_mine();
+
+        app.mine.anime.items = vec![MyListEntry {
+            media: media(1),
+            progress: 1,
+        }];
+        app.mine.anime.page = 1;
+        app.rebuild_mine();
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.items[0].id, 1, "focus starts on the first anime");
     }
 
     #[tokio::test]

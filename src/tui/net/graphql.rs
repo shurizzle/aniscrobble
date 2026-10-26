@@ -6,15 +6,17 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
-use crate::tui::model::{CreditImage, CreditName, Media, MediaDetail};
+use crate::tui::cache::Cache;
+use crate::tui::model::{CreditImage, CreditName, Media, MediaDetail, MediaKind, MyListEntry};
 
 const API: &str = "https://graphql.anilist.co";
 pub const USER_AGENT: &str = concat!("aniscrobble-tui/", env!("CARGO_PKG_VERSION"));
 
 const DETAIL: &str = r#"
-query Detail($id: Int) {
-  Media(id: $id, type: ANIME) {
+query Detail($id: Int, $type: MediaType) {
+  Media(id: $id, type: $type) {
     FIELDS
     mediaListEntry {
       status
@@ -80,10 +82,15 @@ const MEDIA_FIELDS: &str = r#"
       endDate { year month day }
       genres
       description(asHtml: false)
+      type
+      chapters
+      volumes
+      nextAiringEpisode { episode }
 "#;
 
 const RELATION_FIELDS: &str = r#"
           id
+          type
           title { romaji english }
           coverImage { large }
           format
@@ -125,10 +132,104 @@ query Search($search: String, $page: Int, $perPage: Int) {
 }
 "#;
 
+const MY_LIST: &str = r#"
+query MyList($userId: Int, $type: MediaType, $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage }
+    mediaList(
+      userId: $userId
+      type: $type
+      status: CURRENT
+      sort: UPDATED_TIME_DESC
+    ) {
+      progress
+      media {
+        FIELDS
+      }
+    }
+  }
+}
+"#;
+
 #[derive(Serialize)]
 struct Body<'a> {
     query: &'a str,
     variables: Value,
+}
+
+#[derive(Clone, Copy)]
+pub enum CacheMode<'a> {
+    /// Serve a fresh entry without a request.
+    LocalFirst(&'a Cache, &'a str, Duration),
+    /// Always request; use the entry only when the request fails.
+    NetworkFirst(&'a Cache, &'a str),
+}
+
+type CacheRef<'a> = Option<CacheMode<'a>>;
+
+/// Send one GraphQL request and persist a successful body under `key`. A fresh
+/// cached body is returned without touching the network. On a transport or HTTP
+/// failure, the cached body is used even when expired, so everything already
+/// fetched stays readable while offline.
+async fn fetch(client: &Client, cache: CacheRef<'_>, body: &Body<'_>) -> Result<(String, String)> {
+    fetch_from(API, client, cache, body).await
+}
+
+async fn fetch_from(
+    api: &str,
+    client: &Client,
+    cache: CacheRef<'_>,
+    body: &Body<'_>,
+) -> Result<(String, String)> {
+    if let Some(CacheMode::LocalFirst(cache, key, ttl)) = cache
+        && let Some(cached) = cache.read_fresh(key, ttl)
+    {
+        return Ok((
+            "cache".to_string(),
+            String::from_utf8_lossy(&cached).into_owned(),
+        ));
+    }
+
+    let request = client
+        .post(api)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(body);
+    let fallback = || {
+        cache
+            .and_then(|mode| match mode {
+                CacheMode::LocalFirst(cache, key, _) | CacheMode::NetworkFirst(cache, key) => {
+                    cache.read_any(key)
+                }
+            })
+            .map(|cached| {
+                (
+                    "cache".to_string(),
+                    String::from_utf8_lossy(&cached).into_owned(),
+                )
+            })
+    };
+
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.text().await?;
+            if status.is_success() {
+                if let Some(cache) = cache {
+                    match cache {
+                        CacheMode::LocalFirst(cache, key, _)
+                        | CacheMode::NetworkFirst(cache, key) => {
+                            cache.write(key, text.as_bytes());
+                        }
+                    }
+                }
+                Ok((status.as_u16().to_string(), text))
+            } else {
+                Ok(fallback().unwrap_or_else(|| (status.as_u16().to_string(), text)))
+            }
+        }
+        Err(err) => fallback().ok_or_else(|| err.into()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -176,10 +277,14 @@ pub fn browse_query() -> String {
     BROWSE.replace("FIELDS", MEDIA_FIELDS)
 }
 
+pub fn my_list_query() -> String {
+    MY_LIST.replace("FIELDS", MEDIA_FIELDS)
+}
+
 /// Paginated full credit lists: the media page has dedicated tabs for them.
 const CHARACTERS: &str = r#"
-query Characters($id: Int, $page: Int, $perPage: Int) {
-  Media(id: $id, type: ANIME) {
+query Characters($id: Int, $type: MediaType, $page: Int, $perPage: Int) {
+  Media(id: $id, type: $type) {
     characters(page: $page, perPage: $perPage, sort: [ROLE, RELEVANCE, ID]) {
       pageInfo { hasNextPage }
       edges {
@@ -193,8 +298,8 @@ query Characters($id: Int, $page: Int, $perPage: Int) {
 "#;
 
 const STAFF: &str = r#"
-query Staff($id: Int, $page: Int, $perPage: Int) {
-  Media(id: $id, type: ANIME) {
+query Staff($id: Int, $type: MediaType, $page: Int, $perPage: Int) {
+  Media(id: $id, type: $type) {
     staff(page: $page, perPage: $perPage, sort: [RELEVANCE, ID]) {
       pageInfo { hasNextPage }
       edges {
@@ -231,7 +336,9 @@ struct CreditsMedia {
 /// One page of the full character or staff list.
 pub async fn media_credits(
     client: &Client,
+    cache: CacheRef<'_>,
     kind: crate::tui::model::CreditKind,
+    media_kind: MediaKind,
     id: i64,
     page: u32,
     per_page: u32,
@@ -241,18 +348,21 @@ pub async fn media_credits(
         crate::tui::model::CreditKind::Staff => STAFF,
     };
 
-    let response = client
-        .post(API)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .json(&Body {
+    let (status, text) = fetch(
+        client,
+        cache,
+        &Body {
             query,
-            variables: serde_json::json!({ "id": id, "page": page, "perPage": per_page }),
-        })
-        .send()
-        .await?;
+            variables: serde_json::json!({
+                "id": id,
+                "type": media_kind.api_name(),
+                "page": page,
+                "perPage": per_page,
+            }),
+        },
+    )
+    .await?;
 
-    let status = response.status();
-    let text = response.text().await?;
     let parsed: CreditsResponse =
         serde_json::from_str(&text).map_err(|e| anyhow!("unexpected response ({status}): {e}"))?;
 
@@ -455,11 +565,12 @@ fn works(connection: MediaConnection, character_roles: bool) -> Vec<crate::tui::
 /// Staff profile plus one page of their works.
 pub async fn media_staff(
     client: &Client,
+    cache: CacheRef<'_>,
     id: i64,
     page: u32,
     per_page: u32,
 ) -> Result<crate::tui::model::PersonPageData> {
-    let parsed = post_person(client, STAFF_PAGE, id, page, per_page).await?;
+    let parsed = post_person(client, cache, STAFF_PAGE, id, page, per_page).await?;
     let staff = parsed.staff.ok_or_else(|| anyhow!("staff not found"))?;
 
     let mut fields: Vec<(String, String)> = Vec::new();
@@ -538,11 +649,12 @@ pub async fn media_staff(
 /// Character profile plus one page of the media they appear in.
 pub async fn media_character(
     client: &Client,
+    cache: CacheRef<'_>,
     id: i64,
     page: u32,
     per_page: u32,
 ) -> Result<crate::tui::model::PersonPageData> {
-    let parsed = post_person(client, CHARACTER_PAGE, id, page, per_page).await?;
+    let parsed = post_person(client, cache, CHARACTER_PAGE, id, page, per_page).await?;
     let character = parsed
         .character
         .ok_or_else(|| anyhow!("character not found"))?;
@@ -587,23 +699,22 @@ pub async fn media_character(
 
 async fn post_person(
     client: &Client,
+    cache: CacheRef<'_>,
     query: &str,
     id: i64,
     page: u32,
     per_page: u32,
 ) -> Result<PersonData> {
-    let response = client
-        .post(API)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .json(&Body {
+    let (status, text) = fetch(
+        client,
+        cache,
+        &Body {
             query,
             variables: serde_json::json!({ "id": id, "page": page, "perPage": per_page }),
-        })
-        .send()
-        .await?;
+        },
+    )
+    .await?;
 
-    let status = response.status();
-    let text = response.text().await?;
     let parsed: PersonResponse =
         serde_json::from_str(&text).map_err(|e| anyhow!("unexpected response ({status}): {e}"))?;
 
@@ -716,19 +827,22 @@ fn credits(connection: crate::tui::model::CreditConnection) -> Vec<crate::tui::m
         .collect()
 }
 
-pub async fn media_detail(client: &Client, id: i64) -> Result<MediaDetail> {
-    let response = client
-        .post(API)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .json(&Body {
+pub async fn media_detail(
+    client: &Client,
+    cache: CacheRef<'_>,
+    kind: MediaKind,
+    id: i64,
+) -> Result<MediaDetail> {
+    let (status, text) = fetch(
+        client,
+        cache,
+        &Body {
             query: &detail_query(),
-            variables: serde_json::json!({ "id": id }),
-        })
-        .send()
-        .await?;
+            variables: serde_json::json!({ "id": id, "type": kind.api_name() }),
+        },
+    )
+    .await?;
 
-    let status = response.status();
-    let text = response.text().await?;
     let parsed: DetailResponse =
         serde_json::from_str(&text).map_err(|e| anyhow!("unexpected response ({status}): {e}"))?;
 
@@ -770,20 +884,13 @@ pub async fn media_detail(client: &Client, id: i64) -> Result<MediaDetail> {
 
 pub async fn media_list(
     client: &Client,
+    cache: CacheRef<'_>,
     query: &str,
     variables: Value,
 ) -> Result<(Vec<Media>, bool)> {
-    let response = client
-        .post(API)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .json(&Body { query, variables })
-        .send()
-        .await?;
-
-    let status = response.status();
     // AniList reports application errors with a 4xx status and a JSON body, so
     // the body is parsed before the status decides the outcome.
-    let text = response.text().await?;
+    let (status, text) = fetch(client, cache, &Body { query, variables }).await?;
     let parsed: Response =
         serde_json::from_str(&text).map_err(|e| anyhow!("unexpected response ({status}): {e}"))?;
 
@@ -797,6 +904,87 @@ pub async fn media_list(
         .ok_or_else(|| anyhow!("empty response ({status})"))?;
 
     Ok((page.media, page.page_info.has_next_page))
+}
+
+#[derive(Deserialize)]
+struct MyListResponse {
+    #[serde(default)]
+    data: Option<MyListData>,
+    #[serde(default)]
+    errors: Vec<GqlError>,
+}
+
+#[derive(Deserialize)]
+struct MyListData {
+    #[serde(rename = "Page", default)]
+    page: Option<MyListPage>,
+}
+
+#[derive(Deserialize)]
+struct MyListPage {
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+    #[serde(rename = "mediaList", default)]
+    entries: Vec<MyListEdge>,
+}
+
+#[derive(Deserialize)]
+struct MyListEdge {
+    #[serde(default)]
+    progress: i64,
+    #[serde(default)]
+    media: Option<Media>,
+}
+
+fn my_entries(entries: Vec<MyListEdge>) -> Vec<MyListEntry> {
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            Some(MyListEntry {
+                media: entry.media?,
+                progress: entry.progress,
+            })
+        })
+        .collect()
+}
+
+/// One page of the viewer's current anime or manga list.
+pub async fn my_list(
+    client: &Client,
+    cache: CacheRef<'_>,
+    user_id: u64,
+    kind: MediaKind,
+    page: u32,
+    per_page: u32,
+) -> Result<(Vec<MyListEntry>, bool)> {
+    let (status, text) = fetch(
+        client,
+        cache,
+        &Body {
+            query: &my_list_query(),
+            variables: serde_json::json!({
+                "userId": user_id,
+                "type": kind.api_name(),
+                "page": page,
+                "perPage": per_page,
+            }),
+        },
+    )
+    .await?;
+
+    let parsed: MyListResponse =
+        serde_json::from_str(&text).map_err(|e| anyhow!("unexpected response ({status}): {e}"))?;
+
+    if let Some(err) = parsed.errors.first() {
+        return Err(anyhow!("{}", err.message));
+    }
+
+    let page = parsed
+        .data
+        .and_then(|data| data.page)
+        .ok_or_else(|| anyhow!("empty response ({status})"))?;
+
+    Ok((my_entries(page.entries), page.page_info.has_next_page))
 }
 
 #[cfg(test)]
@@ -831,6 +1019,188 @@ mod tests {
         assert_eq!(entry.progress, Some(5));
         assert_eq!(entry.repeat, Some(2));
         assert!(entry.notes.is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_skips_the_network() {
+        let root = std::env::temp_dir().join(format!(
+            "aniscrobble-graphql-cache-fresh-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = crate::database::Database::open(root.join("data.db")).expect("database");
+        let cache = Cache::new(Some(db));
+        let body = Body {
+            query: "query { Viewer { id } }",
+            variables: serde_json::json!({}),
+        };
+        cache.write("anime:1", br#"{"data":{"Viewer":{"id":1}}}"#);
+
+        let client = Client::new();
+        let (status, text) = fetch_from(
+            "http://127.0.0.1:1",
+            &client,
+            Some(CacheMode::LocalFirst(
+                &cache,
+                "anime:1",
+                Duration::from_secs(300),
+            )),
+            &body,
+        )
+        .await
+        .expect("local hit");
+
+        assert_eq!(status, "cache");
+        assert!(text.contains("\"Viewer\""));
+        drop(cache);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn my_list_is_network_first_even_with_a_fresh_entry() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let root = std::env::temp_dir().join(format!(
+            "aniscrobble-graphql-cache-network-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = crate::database::Database::open(root.join("data.db")).expect("database");
+        let cache = Cache::new(Some(db));
+        let key = "my:1:anime:1";
+        cache.write(key, b"cached");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).expect("request body");
+
+            let payload = br#"{"data":{"fresh":true}}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("headers");
+            socket.write_all(payload).expect("body");
+        });
+
+        let body = Body {
+            query: "query { Viewer { id } }",
+            variables: serde_json::json!({}),
+        };
+        let client = Client::new();
+        let (status, text) = fetch_from(
+            &format!("http://{addr}"),
+            &client,
+            Some(CacheMode::NetworkFirst(&cache, key)),
+            &body,
+        )
+        .await
+        .expect("network response");
+
+        assert_eq!(status, "200");
+        assert!(text.contains("\"fresh\""), "fresh cache must be bypassed");
+        assert_eq!(
+            cache.read_any(key),
+            Some(br#"{"data":{"fresh":true}}"#.to_vec())
+        );
+        server.join().expect("server");
+        drop(cache);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn expired_cache_falls_back_when_the_network_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "aniscrobble-graphql-cache-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = crate::database::Database::open(root.join("data.db")).expect("database");
+        let cache = Cache::new(Some(db));
+        let body = Body {
+            query: "query { Viewer { id } }",
+            variables: serde_json::json!({}),
+        };
+        let old = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            - 120;
+        cache.write_at("anime:1", br#"{"data":{"Viewer":{"id":1}}}"#, old);
+
+        let client = Client::new();
+        let (status, text) = fetch_from(
+            "http://127.0.0.1:1",
+            &client,
+            Some(CacheMode::LocalFirst(
+                &cache,
+                "anime:1",
+                Duration::from_secs(60),
+            )),
+            &body,
+        )
+        .await
+        .expect("stale fallback");
+
+        assert_eq!(status, "cache");
+        assert!(text.contains("\"Viewer\""));
+        drop(cache);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn uncached_fetch_never_falls_back() {
+        let body = Body {
+            query: "query Search($search: String) { Page { media(search: $search) { id } } }",
+            variables: serde_json::json!({ "search": "x" }),
+        };
+        let client = Client::new();
+        let result = fetch_from("http://127.0.0.1:1", &client, None, &body).await;
+        assert!(result.is_err(), "search must not be served from cache");
+    }
+
+    #[test]
+    fn my_list_payload_maps_progress_and_media_type() {
+        let payload = r#"{"data":{"Page":{
+          "pageInfo":{"hasNextPage":true},
+          "mediaList":[
+            {"progress":5,"media":{"id":1,"type":"MANGA","chapters":20}},
+            {"progress":2,"media":null}
+          ]}}}"#;
+        let parsed: MyListResponse = serde_json::from_str(payload).expect("parse");
+        let page = parsed.data.and_then(|data| data.page).expect("page");
+        assert!(page.page_info.has_next_page);
+        let entries = my_entries(page.entries);
+        assert_eq!(entries.len(), 1, "entries without media are dropped");
+        assert_eq!(entries[0].progress, 5);
+        assert_eq!(entries[0].media.kind, MediaKind::Manga);
+        assert_eq!(entries[0].media.chapters, Some(20));
     }
 
     #[test]

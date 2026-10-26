@@ -29,6 +29,9 @@ databases:
 
 - `main` (`Str` → bincode `Bytes`): `version`, `login`, `pending`.
 - `data` (`U64` → `U64`): `anilist_id` → highest episode seen locally.
+- `cache` (`Str` → raw `Bytes`): TUI fetch cache, see [Disk cache](#disk-cache).
+  Opened lazily and one of the three named databases, so the environment maps
+  1 GiB.
 
 `pending` is a sorted `Vec<u64>` of ids whose local progress is ahead of the
 server. An entry leaves `pending` only after a successful remote update, which
@@ -74,8 +77,112 @@ meaningful, the sidebar shows it right under the cover: `My Status`, `My Score`,
 progress)`: a pending local scrobble is the truth even when AniList has not been
 synced yet. The value is `progress / episodes` when the episode count is known.
 Without any list entry, a local episode still produces a `Progress` row. Logged
-out with no local episode, no rows are added. Nothing is cached across pages
-beyond the detail response itself, and the TUI never writes the database.
+out with no local episode, no rows are added. The detail response is dropped
+when the page closes; only the disk cache keeps a copy. The TUI never writes the
+database.
+
+### My lists
+
+A logged-in session starts on `Source::Mine`; an anonymous one starts on
+`Source::Trending`. `m` / `M` (or `Tab` back) switch between the current lists
+and trending. The source is a normal list scope with infinite scroll, so
+selection, prefetch, click targets and page opening are shared with the catalog
+list. Without a stored login `m`/`M` are ignored and the source stays trending.
+
+The page is assembled from two sections, anime first and manga second, each with
+its own page cursor:
+
+- `MineLists { anime: MineSection, manga: MineSection }`, where a section holds
+  `items: Vec<MyListEntry>`, `page`, `has_next`, `loading`.
+- `request_page` issues both page-1 requests. Prefetch near the end issues the
+  next page of every section that still has one.
+- Every response updates only its own section, then `rebuild_mine` concatenates
+  anime then manga into `items`, rebuilds `my_progress`, and records
+  `list_headers` (`0` → `ANIME IN PROGRESS`, anime length → `MANGA IN PROGRESS`)
+  for the list renderer. The first rebuild focuses index 0, so the first anime
+  wins even when the manga page answers first; after both first pages have
+  landed, the selected media id is preserved when an earlier section grows.
+
+Each section queries the authenticated `Page.mediaList` connection:
+
+```graphql
+mediaList(userId: var, type: ANIME|MANGA, status: CURRENT, sort: UPDATED_TIME_DESC) {
+  progress
+  media { ...MEDIA_FIELDS }
+}
+```
+
+Rows map to `MyListEntry { media, progress }`. The list shows
+`format · progress / total`, where total is `episodes` for anime or `chapters`
+for manga. An entry is "new" when more episodes/chapters exist than watched:
+anime use `nextAiringEpisode.episode - 1` while airing, or the total when
+finished; manga use `chapters` when finished. New rows render `+N new` in
+yellow. For anime, local progress from `scrobble` is merged as the maximum, so
+a pending sync never looks unwatched. Manga have no local progress source.
+
+Media now carry their AniList `type`. Detail requests and cache keys are
+type-aware (`anime:<id>` / `manga:<id>`), the credit tabs pass the same type,
+and the sidebar shows chapters/volumes instead of episodes for manga. This also
+makes a relation or recommendation opened from a manga page query manga again.
+
+### Disk cache
+
+`src/tui/cache.rs` persists every fetch except search in the CLI's LMDB
+environment, so an interrupted connection does not erase what was already read.
+The cache is the third named database (`cache`, `Str` → raw bytes) in `data.db`;
+no loose files. Each value is `ct1` + the write time as a little-endian `u64`
+epoch second + payload. Entries written before timestamps existed are treated as
+expired but still usable as an offline fallback.
+
+- **GraphQL**: each successful response body is stored under the key of the
+  entity it describes:
+  - `anime:<id>` / `manga:<id>` for the media detail (metadata, relations,
+    credits, viewer entry),
+  - `<anime|manga>:<id>:characters:<page>` and `...:staff:<page>` for the
+    paginated tabs,
+  - `my:<viewer id>:<anime|manga>:<page>` for the current lists,
+  - `staff:<id>:<page>` and `character:<id>:<page>` for person pages,
+  - `trending:<page>`, `genre:<name>:<page>`, `tag:<name>:<page>` for lists.
+
+  Search is deliberately excluded: `search` always performs a live request and
+  has no cached fallback, because a cached search result is a lie about the
+  query.
+
+  A fresh entry is served locally with no request. TTLs:
+
+  | Data | TTL |
+  | --- | --- |
+  | Trending | 15 min |
+  | Media detail | 30 min |
+  | Credit tabs | 12 h |
+  | Genre/tag browse | 24 h |
+  | Staff/character page | 24 h |
+
+  My lists are the one exception: `CacheMode::NetworkFirst` skips the fresh
+  read, so every visit requests AniList. The response is cached and is only
+  used when the request fails.
+
+  Once expired, the request goes out. On a transport error or a non-success
+  status the cached body is parsed instead, even when expired. Clients use a 5 s
+  connect timeout and a 30 s total timeout, so the fallback is bounded even when
+  the network black-holes. A page never fetched has no entry and behaves as
+  before.
+- **Covers**: raw bytes under `<anime|manga>:<id>:cover`,
+  `...:cover:large` and `staff:<id>:portrait` / `character:<id>:portrait`.
+  Covers are cache-first: a hit skips both the network and the semaphore.
+- **Sharing**: keys are global, not scoped per account. The data is public
+  catalog data; the only variant is the viewer list entry inside `anime:<id>`,
+  which a successful request refreshes when logged in.
+- **Durability**: every write is an LMDB transaction, so an interrupted write
+  cannot leave a truncated entry.
+- Every cache operation is best effort: failures are ignored and never turn
+  into a request error.
+- **Growth** is unbounded: no eviction and no per-entry cap. The whole
+  environment maps 1 GiB, which also covers login, progress and pending data.
+
+The cache is read and written by worker tasks, never by the render path. It does
+not make the TUI an offline mode: there is no prefetch, and only data already
+fetched is available.
 
 ### Execution model
 
@@ -168,14 +275,15 @@ A cancelled request produces no user-visible error and no message.
 - `failed_covers: HashSet<key>` keeps a broken URL from being retried on every
   frame. Cleared when the view is replaced.
 
-No TTL for now: the process is short-lived, and a stale catalog entry is
-harmless.
+No TTL for the in-memory caches: they live for one process, and disk cache
+freshness is handled by the per-type TTLs above.
 
 ### Image pipeline
 
 ```text
 draw sees a missing cover (App::cover(url, w, h))
-   -> reqwest GET bytes          (semaphore 3)
+   -> disk cache hit?           (raw bytes, no network)
+      no -> reqwest GET bytes   (semaphore 3), then write cache
    -> spawn_blocking(decode + encode)     image crate + picker.new_protocol
    -> NetMsg::Cover(Arc<Protocol>)
    -> App inserts into covers cache, marks dirty
@@ -302,9 +410,10 @@ never change the selected media.
 | --- | --- |
 | `src/main.rs` | CLI parsing, command dispatch, sync loop, login |
 | `src/api.rs` | blocking AniList GraphQL client (`ureq`), auth header, progress mutation |
-| `src/database.rs` | LMDB storage, login, episode map, pending queue, `SyncContext` |
+| `src/database.rs` | LMDB storage, login, episode map, pending queue, TUI cache database, `SyncContext` |
 | `src/daemon.rs` | unix double-fork detach for background sync |
 | `src/tui/mod.rs` | TUI entry, stored-login lookup, tokio runtime, event loop, `select!`, picker |
+| `src/tui/cache.rs` | persistent GraphQL response and cover cache |
 | `src/tui/term.rs` | terminal init/restore, mouse capture, panic hook |
 | `src/tui/app.rs` | UI state, input handling, message handling, debounce, cache |
 | `src/tui/model.rs` | `Media`, `Title`, `CoverImage` |
@@ -328,6 +437,8 @@ never change the selected media.
 5. Stale messages are dropped silently, never rendered as errors.
 6. The TUI only reads the stored login and local progress at startup; it never
    writes account state.
+7. Cache reads and writes are best effort: a cache failure never fails a
+   request. Fetched GraphQL bodies and covers stay readable offline.
 
 ## Testing
 

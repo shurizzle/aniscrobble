@@ -126,10 +126,20 @@ cached covers.
   optional dependencies only, so `--no-default-features` builds the CLI alone.
 - [x] Bare invocation defaults to `tui` when the feature is on.
 - [x] TUI unit tests run under the default `cargo test`.
+- [x] My lists: default page when logged in, anime and manga sections together
+  with `progress / total`, a `+N new` badge for available episodes/chapters,
+  independent pagination, local progress winning for anime, and type-aware
+  detail pages. Network-first, cached as offline fallback, read-only.
 - [x] Account info: read the CLI's stored login, authenticate the detail query,
   show the viewer's status, score, progress, rewatch count and notes on the
   media page. Local pending progress wins over a lower AniList value. Read-only,
   no rows when logged out.
+- [x] Persistent cache: every successful GraphQL response except search, plus
+  every cover image, is stored in the existing LMDB environment under semantic keys
+  (`anime:<id>`, `staff:<id>:<page>`, `anime:<id>:cover`, ...). Local-first with
+  per-type TTLs, except the current lists, which are always network-first. An
+  expired or failed entry still serves the cache offline. Covers never expire.
+  Search is never cached. No prefetch and no offline toggle yet.
 - [x] README, architecture, agent rules and API notes live in this repository.
 
 ## Later, explicitly out of scope

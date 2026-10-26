@@ -59,6 +59,10 @@ TUI:
 11. Redraw only when `App::dirty` is set.
 12. The TUI only reads the stored login and local progress at startup; it never
     writes account state.
+13. Every fetch except search is persisted. Local-first with a per-type TTL,
+    except my lists, which are always network-first. The cache is the offline
+    fallback in both cases. Search always goes live and has no fallback. Cache
+    failures are ignored, never surfaced.
 
 If a change needs to violate one of these, update `ARCHITECTURE.md` in the same
 change and say why.
@@ -118,8 +122,8 @@ Rules to keep honest:
 In:
 
 - CLI: login, local episode tracking, sync, background sync.
-- TUI: trending, search, detail, staff/character pages, cover images,
-  cancellation model.
+- TUI: trending, search, the viewer's current anime/manga lists, detail,
+  staff/character pages, cover images, cancellation model.
 
 Out (do not add unless asked):
 

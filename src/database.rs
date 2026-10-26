@@ -45,6 +45,8 @@ pub struct Database {
     env: heed::Env,
     main: heed::Database<Str, Bytes>,
     data: Delayed<heed::Database<U64, U64>>,
+    #[cfg(feature = "tui")]
+    cache: Delayed<heed::Database<Str, Bytes>>,
 }
 
 impl crate::IsFatal for heed::Error {
@@ -75,11 +77,16 @@ where
 impl Database {
     pub fn new() -> Result<Self> {
         let dirs = directories::ProjectDirs::from("dev", "shurizzle", "aniscrobble").unwrap();
-        let db_file = dirs.cache_dir().join("data.db");
+        Self::open(dirs.cache_dir().join("data.db"))
+    }
+
+    pub(crate) fn open(db_file: std::path::PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&db_file).context("cannot open database")?;
         let env = unsafe {
             heed::EnvOpenOptions::new()
-                .max_dbs(2)
+                .max_dbs(3)
+                // Covers share the environment with progress records.
+                .map_size(1 << 30)
                 .open(&db_file)
                 .context("cannot open database")?
         };
@@ -105,6 +112,8 @@ impl Database {
             env,
             main,
             data: Delayed::new(),
+            #[cfg(feature = "tui")]
+            cache: Delayed::new(),
         })
     }
 
@@ -118,6 +127,33 @@ impl Database {
                 self.env.create_database(&mut wtxn, Some("data"))
             })
         }
+    }
+
+    #[cfg(feature = "tui")]
+    fn cache_db(&self) -> heed::Result<&heed::Database<Str, Bytes>> {
+        self.cache.get(|| {
+            let mut wtxn = self.env.write_txn()?;
+            let db = self.env.create_database(&mut wtxn, Some("cache"))?;
+            wtxn.commit()?;
+            Ok(db)
+        })
+    }
+
+    /// Last cached fetch for a key, `None` when it was never stored.
+    #[cfg(feature = "tui")]
+    pub fn cache_get(&self, key: &str) -> heed::Result<Option<Vec<u8>>> {
+        let cache = self.cache_db()?;
+        let rtxn = self.env.read_txn()?;
+        Ok(cache.get(&rtxn, key)?.map(|bytes| bytes.to_vec()))
+    }
+
+    /// Store a fetched body. Cache failures are the caller's to ignore.
+    #[cfg(feature = "tui")]
+    pub fn cache_put(&self, key: &str, value: &[u8]) -> heed::Result<()> {
+        let cache = self.cache_db()?;
+        let mut wtxn = self.env.write_txn()?;
+        cache.put(&mut wtxn, key, value)?;
+        wtxn.commit()
     }
 
     pub fn login(&self) -> heed::Result<Option<User>> {

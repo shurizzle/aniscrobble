@@ -8,7 +8,7 @@ use ratatui_image::Image;
 use crate::tui::app::{
     App, CREDIT_COVER, CreditList, PAGE_COVER, PageLink, PagePane, PageTab, THUMB_COVER,
 };
-use crate::tui::model::{Media, MediaListEntry};
+use crate::tui::model::{Media, MediaKind, MediaListEntry};
 use crate::tui::ui::text::{dim, plain_text, truncate};
 
 const LABEL_WIDTH: usize = 16;
@@ -308,7 +308,9 @@ fn sidebar_items(app: &App, item: &Media, width: u16) -> Vec<Item> {
     let mut items: Vec<Item> = vec![Item::Cover];
 
     let entry = app.list_entry();
-    let local = app.local_progress(item.id);
+    let local = (item.kind == MediaKind::Anime)
+        .then(|| app.local_progress(item.id))
+        .flatten();
     if entry.is_some() || local.is_some() {
         items.extend(list_rows(entry, local, item.episodes));
     }
@@ -491,11 +493,25 @@ fn info_rows(item: &Media) -> Vec<Item> {
     let plain = Color::Gray;
 
     push("Format", item.format.clone(), plain);
-    push(
-        "Episodes",
-        item.episodes.map(|episodes| episodes.to_string()),
-        plain,
-    );
+    match item.kind {
+        MediaKind::Anime => push(
+            "Episodes",
+            item.episodes.map(|episodes| episodes.to_string()),
+            plain,
+        ),
+        MediaKind::Manga => {
+            push(
+                "Chapters",
+                item.chapters.map(|chapters| chapters.to_string()),
+                plain,
+            );
+            push(
+                "Volumes",
+                item.volumes.map(|volumes| volumes.to_string()),
+                plain,
+            );
+        }
+    }
     push(
         "Duration",
         item.duration.map(|mins| format!("{mins} min")),
@@ -830,15 +846,13 @@ fn draw_items(
                 if let Some(link) = link {
                     app.page_links.push((rect, link.clone()));
                 }
-                draw_person(
-                    f,
-                    app,
-                    (name, role),
-                    image.as_deref(),
-                    rect,
-                    height,
-                    focused,
-                );
+                let key = match link.as_ref() {
+                    Some(PageLink::Staff(id)) => format!("staff:{id}:portrait"),
+                    Some(PageLink::Character(id)) => format!("character:{id}:portrait"),
+                    _ => format!("portrait:{}", image.as_deref().unwrap_or_default()),
+                };
+                let image = image.as_deref().map(|url| (url, key.as_str()));
+                draw_person(f, app, (name, role), image, rect, height, focused);
             }
         }
     }
@@ -850,9 +864,15 @@ fn draw_cover(f: &mut Frame, app: &mut App, rect: Rect) {
     let Some(item) = app.page_media() else {
         return;
     };
+    let kind = item.kind.label();
+    let key = if item.cover_image.extra_large.is_some() {
+        format!("{kind}:{}:cover:large", item.id)
+    } else {
+        format!("{kind}:{}:cover", item.id)
+    };
     let proto = item
         .cover_url_large()
-        .and_then(|url| app.cover(url, PAGE_COVER.0, PAGE_COVER.1));
+        .and_then(|url| app.cover(&key, url, PAGE_COVER.0, PAGE_COVER.1));
 
     match proto {
         Some(proto) => {
@@ -886,10 +906,14 @@ fn draw_entry(
     let thumb_height = full_height.min(rect.height);
     let thumb_area = Rect::new(rect.x, rect.y, thumb_width, thumb_height);
 
-    match media
-        .cover_url()
-        .and_then(|url| app.cover(url, THUMB_COVER.0, THUMB_COVER.1))
-    {
+    match media.cover_url().and_then(|url| {
+        app.cover(
+            &format!("{}:{}:cover", media.kind.label(), media.id),
+            url,
+            THUMB_COVER.0,
+            THUMB_COVER.1,
+        )
+    }) {
         Some(proto) => {
             let size = proto.size();
             f.render_widget(
@@ -960,7 +984,7 @@ fn draw_person(
     f: &mut Frame,
     app: &mut App,
     (name, role): (&str, &str),
-    image: Option<&str>,
+    image: Option<(&str, &str)>,
     rect: Rect,
     full_height: u16,
     focused: bool,
@@ -969,7 +993,7 @@ fn draw_person(
     let thumb_height = full_height.min(rect.height);
     let thumb_area = Rect::new(rect.x, rect.y, thumb_width, thumb_height);
 
-    match image.and_then(|url| app.cover(url, CREDIT_COVER.0, CREDIT_COVER.1)) {
+    match image.and_then(|(url, key)| app.cover(key, url, CREDIT_COVER.0, CREDIT_COVER.1)) {
         Some(proto) => {
             let size = proto.size();
             f.render_widget(
@@ -2042,8 +2066,14 @@ mod tests {
     async fn sidebar_shows_the_viewer_list_entry() {
         let picker = Arc::new(Picker::halfblocks());
         let (tx, _rx) = mpsc::channel(4);
-        let mut app =
-            App::with_account(picker, tx, None, std::collections::HashMap::from([(1, 7)]));
+        let mut app = App::with_account(
+            picker,
+            tx,
+            None,
+            None,
+            None,
+            std::collections::HashMap::from([(1, 7)]),
+        );
         let main = Media {
             episodes: Some(12),
             ..sample("Main Show", 1)

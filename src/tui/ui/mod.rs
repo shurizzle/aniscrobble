@@ -108,8 +108,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("   r retry", Style::new().fg(Color::DarkGray)),
         ]),
         None => {
-            let mut hint =
-                String::from(" j/k move  Enter open  / search  Tab source  r reload  q quit");
+            let mut hint = String::from(
+                " j/k move  Enter open  / search  Tab source  m/M my lists  r reload  q quit",
+            );
             if app.has_browse_origin() {
                 hint.push_str("  ⌫ back to page");
             }

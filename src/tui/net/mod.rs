@@ -13,6 +13,7 @@ pub mod rate;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::layout::Size;
@@ -24,19 +25,30 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::tui::model::{Credit, CreditKind, Media, MediaDetail, PersonKind, PersonPageData};
+use crate::tui::model::{
+    Credit, CreditKind, Media, MediaDetail, MediaKind, MyListEntry, PersonKind, PersonPageData,
+};
 use rate::RateLimiter;
 
 pub type ScopeId = u64;
+
+/// How long a cached response is served without a network request. Search has
+/// no TTL because it is never cached.
+const TTL_TRENDING: Duration = Duration::from_secs(15 * 60);
+const TTL_BROWSE: Duration = Duration::from_secs(24 * 60 * 60);
+const TTL_DETAIL: Duration = Duration::from_secs(30 * 60);
+const TTL_CREDITS: Duration = Duration::from_secs(12 * 60 * 60);
+const TTL_PERSON: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReqKey {
     Trending(u32),
     Search(String, u32),
-    Detail(i64),
+    Detail(MediaKind, i64),
     Browse(String, u32),
     Credits(CreditKind, u32),
     Person(PersonKind, i64, u32),
+    Mine(MediaKind, u32),
     Cover { url: String, w: u16, h: u16 },
 }
 
@@ -61,6 +73,7 @@ pub enum Job {
     /// One page of the full character or staff list.
     Credits {
         kind: CreditKind,
+        media_kind: MediaKind,
         id: i64,
         page: u32,
         per_page: u32,
@@ -75,11 +88,21 @@ pub enum Job {
     /// Extra data for the media page: relations and recommendations.
     Detail {
         id: i64,
+        kind: MediaKind,
+    },
+    /// One page of the viewer's current anime or manga list.
+    Mine {
+        kind: MediaKind,
+        user_id: u64,
+        page: u32,
+        per_page: u32,
     },
     Cover {
         url: String,
         w: u16,
         h: u16,
+        /// Semantic disk-cache key, e.g. `anime:21:cover`.
+        key: String,
     },
 }
 
@@ -101,6 +124,14 @@ pub enum NetMsg {
         req: u64,
         page: u32,
         data: Box<PersonPageData>,
+    },
+    Mine {
+        scope: ScopeId,
+        req: u64,
+        kind: MediaKind,
+        page: u32,
+        items: Vec<MyListEntry>,
+        has_next: bool,
     },
     Credits {
         scope: ScopeId,
@@ -134,6 +165,7 @@ struct Runner {
     client: reqwest::Client,
     /// Image client. Never sends the token to the AniList CDN.
     images: reqwest::Client,
+    cache: crate::tui::cache::Cache,
     picker: Arc<Picker>,
     gql: Semaphore,
     covers: Semaphore,
@@ -153,29 +185,29 @@ pub struct Net {
 impl Net {
     #[cfg(test)]
     pub fn new(picker: Arc<Picker>, tx: mpsc::Sender<NetMsg>) -> Self {
-        Self::with_token(picker, tx, None)
+        Self::with_account(picker, tx, None, None)
     }
 
-    pub fn with_token(
+    pub fn with_account(
         picker: Arc<Picker>,
         tx: mpsc::Sender<NetMsg>,
         token: Option<String>,
+        db: Option<crate::database::Database>,
     ) -> Self {
         let build = || {
             reqwest::Client::builder()
                 .user_agent(graphql::USER_AGENT)
-                .build()
-                .expect("reqwest client")
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
         };
-        let images = build();
+        let images = build().build().expect("reqwest client");
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(token) = token.as_deref()
             && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
         {
             headers.insert(reqwest::header::AUTHORIZATION, value);
         }
-        let client = reqwest::Client::builder()
-            .user_agent(graphql::USER_AGENT)
+        let client = build()
             .default_headers(headers)
             .build()
             .expect("reqwest client");
@@ -184,6 +216,7 @@ impl Net {
             runner: Arc::new(Runner {
                 client,
                 images,
+                cache: crate::tui::cache::Cache::new(db),
                 picker,
                 gql: Semaphore::new(4),
                 covers: Semaphore::new(3),
@@ -310,11 +343,17 @@ impl Net {
 async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetMsg> {
     match job {
         Job::Trending { page, per_page } => {
+            let key = format!("trending:{page}");
             let items = {
                 let _permit = runner.gql.acquire().await?;
                 runner.rate.acquire().await;
                 graphql::media_list(
                     &runner.client,
+                    Some(graphql::CacheMode::LocalFirst(
+                        &runner.cache,
+                        &key,
+                        TTL_TRENDING,
+                    )),
                     &graphql::trending_query(),
                     json!({ "page": page, "perPage": per_page }),
                 )
@@ -338,6 +377,7 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
                 runner.rate.acquire().await;
                 graphql::media_list(
                     &runner.client,
+                    None,
                     &graphql::search_query(),
                     json!({ "search": query, "page": page, "perPage": per_page }),
                 )
@@ -357,11 +397,21 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
             page,
             per_page,
         } => {
+            let key = match (&genre, &tag) {
+                (Some(genre), _) => format!("genre:{genre}:{page}"),
+                (_, Some(tag)) => format!("tag:{tag}:{page}"),
+                _ => format!("browse:{page}"),
+            };
             let items = {
                 let _permit = runner.gql.acquire().await?;
                 runner.rate.acquire().await;
                 graphql::media_list(
                     &runner.client,
+                    Some(graphql::CacheMode::LocalFirst(
+                        &runner.cache,
+                        &key,
+                        TTL_BROWSE,
+                    )),
                     &graphql::browse_query(),
                     json!({ "genre": genre, "tag": tag, "page": page, "perPage": per_page }),
                 )
@@ -377,14 +427,33 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
         }
         Job::Credits {
             kind,
+            media_kind,
             id,
             page,
             per_page,
         } => {
+            let credit = match kind {
+                CreditKind::Characters => "characters",
+                CreditKind::Staff => "staff",
+            };
+            let key = format!("{}:{id}:{credit}:{page}", media_kind.label());
             let (items, has_next) = {
                 let _permit = runner.gql.acquire().await?;
                 runner.rate.acquire().await;
-                graphql::media_credits(&runner.client, kind, id, page, per_page).await?
+                graphql::media_credits(
+                    &runner.client,
+                    Some(graphql::CacheMode::LocalFirst(
+                        &runner.cache,
+                        &key,
+                        TTL_CREDITS,
+                    )),
+                    kind,
+                    media_kind,
+                    id,
+                    page,
+                    per_page,
+                )
+                .await?
             };
             Ok(NetMsg::Credits {
                 scope,
@@ -401,15 +470,44 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
             page,
             per_page,
         } => {
+            let key = format!(
+                "{}:{id}:{page}",
+                match kind {
+                    PersonKind::Staff => "staff",
+                    PersonKind::Character => "character",
+                }
+            );
             let data = {
                 let _permit = runner.gql.acquire().await?;
                 runner.rate.acquire().await;
                 match kind {
                     PersonKind::Staff => {
-                        graphql::media_staff(&runner.client, id, page, per_page).await?
+                        graphql::media_staff(
+                            &runner.client,
+                            Some(graphql::CacheMode::LocalFirst(
+                                &runner.cache,
+                                &key,
+                                TTL_PERSON,
+                            )),
+                            id,
+                            page,
+                            per_page,
+                        )
+                        .await?
                     }
                     PersonKind::Character => {
-                        graphql::media_character(&runner.client, id, page, per_page).await?
+                        graphql::media_character(
+                            &runner.client,
+                            Some(graphql::CacheMode::LocalFirst(
+                                &runner.cache,
+                                &key,
+                                TTL_PERSON,
+                            )),
+                            id,
+                            page,
+                            per_page,
+                        )
+                        .await?
                     }
                 }
             };
@@ -420,11 +518,51 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
                 data: Box::new(data),
             })
         }
-        Job::Detail { id } => {
+        Job::Mine {
+            kind,
+            user_id,
+            page,
+            per_page,
+        } => {
+            let key = format!("my:{user_id}:{}:{page}", kind.label());
+            let (items, has_next) = {
+                let _permit = runner.gql.acquire().await?;
+                runner.rate.acquire().await;
+                graphql::my_list(
+                    &runner.client,
+                    Some(graphql::CacheMode::NetworkFirst(&runner.cache, &key)),
+                    user_id,
+                    kind,
+                    page,
+                    per_page,
+                )
+                .await?
+            };
+            Ok(NetMsg::Mine {
+                scope,
+                req,
+                kind,
+                page,
+                items,
+                has_next,
+            })
+        }
+        Job::Detail { id, kind } => {
+            let key = format!("{}:{id}", kind.label());
             let data = {
                 let _permit = runner.gql.acquire().await?;
                 runner.rate.acquire().await;
-                graphql::media_detail(&runner.client, id).await?
+                graphql::media_detail(
+                    &runner.client,
+                    Some(graphql::CacheMode::LocalFirst(
+                        &runner.cache,
+                        &key,
+                        TTL_DETAIL,
+                    )),
+                    kind,
+                    id,
+                )
+                .await?
             };
             Ok(NetMsg::Detail {
                 scope,
@@ -432,18 +570,25 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
                 data: Box::new(data),
             })
         }
-        Job::Cover { url, w, h } => {
-            let bytes = {
-                let _permit = runner.covers.acquire().await?;
-                runner
-                    .images
-                    .get(&url)
-                    .header(reqwest::header::USER_AGENT, graphql::USER_AGENT)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .bytes()
-                    .await?
+        Job::Cover { url, w, h, key } => {
+            let bytes = match runner.cache.read_any(&key) {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = {
+                        let _permit = runner.covers.acquire().await?;
+                        runner
+                            .images
+                            .get(&url)
+                            .header(reqwest::header::USER_AGENT, graphql::USER_AGENT)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .bytes()
+                            .await?
+                    };
+                    runner.cache.write(&key, &bytes);
+                    bytes.to_vec()
+                }
             };
 
             let picker = runner.picker.clone();
@@ -531,7 +676,8 @@ mod tests {
             Job::Cover {
                 url: url.clone(),
                 w: 2,
-                h: 2
+                h: 2,
+                key: "anime:1:cover".into(),
             },
         ));
         assert_eq!(net.inflight(), 1);

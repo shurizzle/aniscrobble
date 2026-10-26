@@ -245,10 +245,14 @@ fn draw_work(
     let thumb_height = full_height.min(rect.height);
     let thumb_area = Rect::new(rect.x, rect.y, thumb_width, thumb_height);
 
-    match media
-        .cover_url()
-        .and_then(|url| app.cover(url, THUMB_COVER.0, THUMB_COVER.1))
-    {
+    match media.cover_url().and_then(|url| {
+        app.cover(
+            &format!("{}:{}:cover", media.kind.label(), media.id),
+            url,
+            THUMB_COVER.0,
+            THUMB_COVER.1,
+        )
+    }) {
         Some(proto) => {
             let size = proto.size();
             f.render_widget(
@@ -308,12 +312,17 @@ fn draw_work(
 }
 
 fn draw_portrait(f: &mut Frame, app: &mut App, data: Option<&PersonPageData>, area: Rect) {
-    let Some(url) = data.and_then(|data| data.image.as_deref()) else {
+    let Some(data) = data else {
         f.render_widget(Paragraph::new(dim("···")), area);
         return;
     };
+    let Some(url) = data.image.as_deref() else {
+        f.render_widget(Paragraph::new(dim("···")), area);
+        return;
+    };
+    let key = format!("{}:{}:portrait", data.kind_url_path(), data.id);
 
-    match app.cover(url, STAFF_PORTRAIT.0, STAFF_PORTRAIT.1) {
+    match app.cover(&key, url, STAFF_PORTRAIT.0, STAFF_PORTRAIT.1) {
         Some(proto) => {
             let size = proto.size();
             f.render_widget(

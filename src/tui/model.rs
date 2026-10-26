@@ -49,6 +49,52 @@ pub struct Media {
     pub genres: Vec<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub chapters: Option<i64>,
+    #[serde(default)]
+    pub volumes: Option<i64>,
+    #[serde(rename = "nextAiringEpisode", default)]
+    pub next_airing_episode: Option<AiringEpisode>,
+    #[serde(rename = "type", default)]
+    pub kind: MediaKind,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AiringEpisode {
+    #[serde(default)]
+    pub episode: i64,
+}
+
+/// The media list a source shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum MediaKind {
+    #[default]
+    Anime,
+    Manga,
+}
+
+impl MediaKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaKind::Anime => "anime",
+            MediaKind::Manga => "manga",
+        }
+    }
+
+    pub fn api_name(self) -> &'static str {
+        match self {
+            MediaKind::Anime => "ANIME",
+            MediaKind::Manga => "MANGA",
+        }
+    }
+}
+
+/// One entry of the viewer's current list.
+#[derive(Debug, Clone, Default)]
+pub struct MyListEntry {
+    pub media: Media,
+    pub progress: i64,
 }
 
 impl Media {
@@ -70,6 +116,28 @@ impl Media {
             .extra_large
             .as_deref()
             .or(self.cover_image.large.as_deref())
+    }
+
+    /// Episodes for anime, chapters for manga.
+    pub fn total(&self, kind: MediaKind) -> Option<i64> {
+        match kind {
+            MediaKind::Anime => self.episodes,
+            MediaKind::Manga => self.chapters,
+        }
+    }
+
+    /// How many episodes/chapters exist to consume. Anime use the episode
+    /// before the next airing one; finished media use their total.
+    pub fn available(&self, kind: MediaKind) -> Option<i64> {
+        if kind == MediaKind::Anime
+            && let Some(next) = &self.next_airing_episode
+        {
+            return Some((next.episode - 1).max(0));
+        }
+        match self.status.as_deref() {
+            Some("FINISHED") => self.total(kind),
+            _ => None,
+        }
     }
 }
 
