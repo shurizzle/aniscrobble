@@ -9,6 +9,9 @@ mod api;
 mod daemon;
 mod database;
 
+#[cfg(feature = "tui")]
+mod tui;
+
 pub trait IsFatal {
     fn is_fatal(&self) -> bool;
 }
@@ -17,8 +20,31 @@ pub trait IsFatal {
 #[command(version, about, long_about)]
 #[command(propagate_version = true)]
 struct Cli {
+    #[cfg(feature = "tui")]
+    #[command(subcommand)]
+    command: Option<Commands>,
+    #[cfg(not(feature = "tui"))]
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    fn with_command(command: Commands) -> Self {
+        #[cfg(feature = "tui")]
+        let command = Some(command);
+        Self { command }
+    }
+
+    fn command(self) -> Commands {
+        #[cfg(feature = "tui")]
+        {
+            self.command.unwrap_or(Commands::Tui)
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            self.command
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -39,13 +65,27 @@ enum Commands {
         anilist_id: u64,
         episode: u64,
     },
+    #[cfg(feature = "tui")]
+    Tui,
+}
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_invocation_opens_tui() {
+        let cli = Cli::try_parse_from(["aniscrobble"]).expect("bare args");
+        assert!(matches!(cli.command(), Commands::Tui));
+    }
 }
 
 #[inline(always)]
 fn _main() -> Result<()> {
     let mut cli = Cli::parse();
     loop {
-        match match cli.command {
+        let command = cli.command();
+        match match command {
             Commands::Login { force } => login(force),
             Commands::Sync => sync(None),
             Commands::Scrobble {
@@ -54,6 +94,11 @@ fn _main() -> Result<()> {
                 anilist_id,
                 episode,
             } => scrobble(anilist_id, episode, background, local_only),
+            #[cfg(feature = "tui")]
+            Commands::Tui => {
+                tui::run()?;
+                Ok(None)
+            }
         }? {
             Some(c) => cli = c,
             None => return Ok(()),
@@ -168,9 +213,7 @@ fn scrobble(
     #[cfg(not(windows))]
     {
         match unsafe { daemon::daemonize()? } {
-            daemon::Whoami::Child => Ok(Some(Cli {
-                command: Commands::Sync,
-            })),
+            daemon::Whoami::Child => Ok(Some(Cli::with_command(Commands::Sync))),
 
             daemon::Whoami::Parent(res) => {
                 if res {
