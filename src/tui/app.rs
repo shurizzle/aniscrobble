@@ -148,6 +148,8 @@ pub struct App {
     /// leaves scrolling completely free.
     pub reveal_cursor: bool,
     pub detail_data: Option<MediaDetail>,
+    /// Episode reached locally, including progress not synced to AniList yet.
+    local_progress: HashMap<i64, i64>,
     /// Media currently shown by the page, possibly not loaded in full yet.
     pub page_subject: Option<Media>,
     /// Previously visited pages, most recent last. `Backspace` pops it.
@@ -175,9 +177,19 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(picker: Arc<Picker>, tx: mpsc::Sender<NetMsg>) -> Self {
+        Self::with_account(picker, tx, None, HashMap::new())
+    }
+
+    pub fn with_account(
+        picker: Arc<Picker>,
+        tx: mpsc::Sender<NetMsg>,
+        token: Option<String>,
+        local_progress: HashMap<i64, i64>,
+    ) -> Self {
         let protocol = format!("{:?}", picker.protocol_type()).to_lowercase();
-        let mut net = Net::new(picker, tx);
+        let mut net = Net::with_token(picker, tx, token);
         let scope = net.mount();
 
         let mut app = Self {
@@ -206,6 +218,7 @@ impl App {
             show_spoiler_tags: false,
             browse_origin: None,
             detail_data: None,
+            local_progress,
             page_subject: None,
             page_history: Vec::new(),
             page_links: Vec::new(),
@@ -1249,6 +1262,27 @@ impl App {
             .map(|data| data.media.clone())
             .or_else(|| self.page_subject.clone())
             .or_else(|| self.selected_item().cloned())
+    }
+
+    /// Viewer's list entry for the open page, once the detail request landed.
+    pub fn list_entry(&self) -> Option<&crate::tui::model::MediaListEntry> {
+        let data = self.detail_data.as_ref()?;
+        let entry = data.list_entry.as_ref()?;
+        (entry.status.is_some()
+            || entry.score.is_some_and(|score| score > 0.0)
+            || entry.progress.is_some_and(|progress| progress > 0)
+            || entry.repeat.is_some_and(|repeat| repeat > 0)
+            || entry
+                .notes
+                .as_ref()
+                .is_some_and(|notes| !notes.trim().is_empty()))
+        .then_some(entry)
+    }
+
+    /// Local episode for a media, possibly ahead of AniList. The UI treats it
+    /// as the truth when it is greater than the remote progress.
+    pub fn local_progress(&self, id: i64) -> Option<i64> {
+        self.local_progress.get(&id).copied()
     }
 
     #[cfg(test)]

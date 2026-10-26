@@ -61,6 +61,14 @@ cargo run --release -- tui
 The feature is on by default, so a bare `aniscrobble` also opens the TUI. With
 `--no-default-features` the subcommand does not exist and a command is required.
 
+If you are logged in (`aniscrobble login`), the TUI reads the stored token at
+startup. The media page sidebar then starts with your list entry: **My Status**,
+**My Score**, **Progress**, **Rewatched** and **Notes**. Progress is the higher
+of the AniList value and the episode recorded locally by `scrobble`, so a
+pending sync is shown immediately even before `sync` runs. Logged out, or for
+media not on your list, those rows are absent. The TUI is read-only: it never
+changes your list.
+
 ### Screenshots
 
 Trending list:
@@ -155,5 +163,6 @@ returns to the list.
 
 ## Status
 
-CLI: login, local progress and sync are usable. TUI: PoC, no login, no list
-mutations, no persistence of the catalog. See the roadmap.
+CLI: login, local progress and sync are usable. TUI: PoC, read-only account
+info when logged in, no list mutations, no persistence of the catalog. See the
+roadmap.

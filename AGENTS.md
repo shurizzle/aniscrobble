@@ -57,7 +57,8 @@ TUI:
    flicker.
 10. `select!` in the main loop keeps terminal input first (`biased`).
 11. Redraw only when `App::dirty` is set.
-12. The TUI does not read the database. Account state belongs to the CLI.
+12. The TUI only reads the stored login and local progress at startup; it never
+    writes account state.
 
 If a change needs to violate one of these, update `ARCHITECTURE.md` in the same
 change and say why.

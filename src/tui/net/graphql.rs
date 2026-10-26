@@ -16,6 +16,13 @@ const DETAIL: &str = r#"
 query Detail($id: Int) {
   Media(id: $id, type: ANIME) {
     FIELDS
+    mediaListEntry {
+      status
+      score
+      progress
+      repeat
+      notes
+    }
     relations {
       edges {
         relationType
@@ -673,6 +680,8 @@ struct DetailData {
 struct DetailMedia {
     #[serde(flatten)]
     media: Media,
+    #[serde(rename = "mediaListEntry", default)]
+    list_entry: Option<crate::tui::model::MediaListEntry>,
     #[serde(default)]
     relations: crate::tui::model::Relations,
     #[serde(default)]
@@ -751,6 +760,7 @@ pub async fn media_detail(client: &Client, id: i64) -> Result<MediaDetail> {
 
     Ok(MediaDetail {
         media: media.media,
+        list_entry: media.list_entry,
         relations,
         recommendations,
         characters: credits(media.characters),
@@ -807,6 +817,20 @@ mod tests {
         assert_eq!(characters[0].role.as_deref(), Some("MAIN"));
         assert_eq!(staff.len(), 1);
         assert_eq!(staff[0].name, "Mike");
+    }
+
+    #[test]
+    fn detail_payload_maps_the_viewer_list_entry() {
+        let payload = r#"{"data":{"Media":{"id":1,
+          "mediaListEntry":{"status":"CURRENT","score":8.5,"progress":5,"repeat":2,"notes":null}}}}"#;
+        let parsed: DetailResponse = serde_json::from_str(payload).expect("parse");
+        let media = parsed.data.and_then(|d| d.media).expect("media");
+        let entry = media.list_entry.expect("list entry");
+        assert_eq!(entry.status.as_deref(), Some("CURRENT"));
+        assert_eq!(entry.score, Some(8.5));
+        assert_eq!(entry.progress, Some(5));
+        assert_eq!(entry.repeat, Some(2));
+        assert!(entry.notes.is_none());
     }
 
     #[test]

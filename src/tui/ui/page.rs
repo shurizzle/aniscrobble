@@ -8,7 +8,7 @@ use ratatui_image::Image;
 use crate::tui::app::{
     App, CREDIT_COVER, CreditList, PAGE_COVER, PageLink, PagePane, PageTab, THUMB_COVER,
 };
-use crate::tui::model::Media;
+use crate::tui::model::{Media, MediaListEntry};
 use crate::tui::ui::text::{dim, plain_text, truncate};
 
 const LABEL_WIDTH: usize = 16;
@@ -307,6 +307,12 @@ fn credit_items(
 fn sidebar_items(app: &App, item: &Media, width: u16) -> Vec<Item> {
     let mut items: Vec<Item> = vec![Item::Cover];
 
+    let entry = app.list_entry();
+    let local = app.local_progress(item.id);
+    if entry.is_some() || local.is_some() {
+        items.extend(list_rows(entry, local, item.episodes));
+    }
+
     for row in info_rows(item) {
         items.push(row);
     }
@@ -390,6 +396,85 @@ fn pack_tags(tags: &[(String, bool)], width: usize) -> Vec<Vec<(String, bool)>> 
         lines.push(current);
     }
     lines
+}
+
+fn list_rows(
+    entry: Option<&MediaListEntry>,
+    local_progress: Option<i64>,
+    episodes: Option<i64>,
+) -> Vec<Item> {
+    let mut rows = Vec::new();
+    let list = Color::Cyan;
+    let remote = entry.and_then(|entry| entry.progress).unwrap_or(0);
+    // Local progress wins when it is ahead: it is what the user actually
+    // watched, even if the sync has not reached AniList yet.
+    let progress = local_progress.unwrap_or(remote).max(remote);
+
+    if let Some(status) = entry.and_then(|entry| entry.status.as_deref()) {
+        rows.push(Item::Row {
+            label: "My Status",
+            value: list_status_label(status),
+            color: list,
+        });
+    }
+    if let Some(score) = entry.and_then(|entry| entry.score.filter(|score| *score > 0.0)) {
+        rows.push(Item::Row {
+            label: "My Score",
+            value: if score.fract() == 0.0 {
+                format!("{score:.0}")
+            } else {
+                format!("{score:.1}")
+            },
+            color: list,
+        });
+    }
+    if progress > 0 {
+        let value = match episodes.filter(|episodes| *episodes > 0) {
+            Some(total) => format!("{progress} / {total}"),
+            None => progress.to_string(),
+        };
+        rows.push(Item::Row {
+            label: "Progress",
+            value,
+            color: if episodes == Some(progress) {
+                Color::Green
+            } else {
+                list
+            },
+        });
+    }
+    if let Some(repeat) = entry.and_then(|entry| entry.repeat.filter(|repeat| *repeat > 0)) {
+        rows.push(Item::Row {
+            label: "Rewatched",
+            value: repeat.to_string(),
+            color: list,
+        });
+    }
+    if let Some(notes) = entry
+        .and_then(|entry| entry.notes.as_deref())
+        .map(|notes| notes.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|notes| !notes.is_empty())
+    {
+        rows.push(Item::Row {
+            label: "Notes",
+            value: notes,
+            color: Color::Gray,
+        });
+    }
+
+    rows
+}
+
+fn list_status_label(status: &str) -> String {
+    match status {
+        "CURRENT" => "Watching".to_string(),
+        "REPEATING" => "Rewatching".to_string(),
+        "PLANNING" => "Planning".to_string(),
+        "COMPLETED" => "Completed".to_string(),
+        "PAUSED" => "Paused".to_string(),
+        "DROPPED" => "Dropped".to_string(),
+        other => title_case(other),
+    }
 }
 
 fn info_rows(item: &Media) -> Vec<Item> {
@@ -1161,7 +1246,9 @@ mod tests {
     use ratatui_image::picker::Picker;
     use tokio::sync::mpsc;
 
-    use super::{date_label, grouped, score_color, season_label, status_label, wrap_text};
+    use super::{
+        Item, date_label, grouped, list_rows, score_color, season_label, status_label, wrap_text,
+    };
     use crate::tui::app::{App, PAGE_COVER, PageLink, PagePane, PageTab};
     use crate::tui::model::{
         CoverImage, FuzzyDate, Media, MediaDetail, Relation, Studio, Studios, Tag, Title,
@@ -1753,6 +1840,7 @@ mod tests {
         app.set_items_for_test(vec![main.clone()]);
         app.set_detail_for_test(MediaDetail {
             media: main,
+            list_entry: None,
             relations: Vec::new(),
             characters: vec![
                 crate::tui::model::Credit {
@@ -1948,5 +2036,68 @@ mod tests {
         );
         assert_eq!(season_label(None, Some(2026)), None);
         assert_eq!(status_label("NOT_YET_RELEASED"), "Not yet released");
+    }
+
+    #[tokio::test]
+    async fn sidebar_shows_the_viewer_list_entry() {
+        let picker = Arc::new(Picker::halfblocks());
+        let (tx, _rx) = mpsc::channel(4);
+        let mut app =
+            App::with_account(picker, tx, None, std::collections::HashMap::from([(1, 7)]));
+        let main = Media {
+            episodes: Some(12),
+            ..sample("Main Show", 1)
+        };
+        app.set_items_for_test(vec![main.clone()]);
+        app.set_detail_for_test(MediaDetail {
+            media: main,
+            list_entry: Some(crate::tui::model::MediaListEntry {
+                status: Some("CURRENT".into()),
+                score: Some(8.5),
+                progress: Some(5),
+                repeat: Some(2),
+                notes: Some("rewatch with\nfriends".into()),
+            }),
+            ..Default::default()
+        });
+        app.detail = true;
+
+        let text = render(&mut app, 140, 70);
+        for needle in [
+            "My Status",
+            "Watching",
+            "My Score",
+            "8.5",
+            "7 / 12",
+            "rewatch with",
+        ] {
+            assert!(text.contains(needle), "page is missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn local_progress_is_the_truth_when_it_is_ahead() {
+        let entry = crate::tui::model::MediaListEntry {
+            status: Some("CURRENT".into()),
+            progress: Some(3),
+            ..Default::default()
+        };
+        let progress = |entry, local| {
+            list_rows(entry, local, Some(12))
+                .into_iter()
+                .find_map(|item| match item {
+                    Item::Row {
+                        label: "Progress",
+                        value,
+                        ..
+                    } => Some(value),
+                    _ => None,
+                })
+        };
+
+        assert_eq!(progress(Some(&entry), Some(7)).as_deref(), Some("7 / 12"));
+        assert_eq!(progress(Some(&entry), Some(2)).as_deref(), Some("3 / 12"));
+        assert_eq!(progress(None, Some(4)).as_deref(), Some("4 / 12"));
+        assert_eq!(progress(None, None), None);
     }
 }

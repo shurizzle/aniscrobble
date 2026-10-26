@@ -101,6 +101,13 @@ when a related entry is clicked.
 query Detail($id: Int) {
   Media(id: $id, type: ANIME) {
     # ...the full field set used by the list query...
+    mediaListEntry {
+      status
+      score
+      progress
+      repeat
+      notes
+    }
     relations {
       edges {
         relationType
@@ -131,6 +138,12 @@ query Detail($id: Int) {
   }
 }
 ```
+
+`mediaListEntry` is viewer-specific: it is `null` without a token and `null`
+when the media is not on the user's list. `score` is a `Float` whose scale
+follows the user's AniList settings (100, 10-decimal, 5 stars, 3-point), so show
+it raw rather than appending a fixed `/ 100`. `notes` can be `null` or contain
+newlines.
 
 `coverImage` is required on the nodes: the page shows a thumbnail for every
 relation and recommendation.

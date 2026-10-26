@@ -143,6 +143,19 @@ impl Database {
         Ok(())
     }
 
+    /// Every locally recorded episode, keyed by AniList media id.
+    #[cfg(feature = "tui")]
+    pub fn progresses(&self) -> heed::Result<std::collections::HashMap<u64, u64>> {
+        let data = self.data(None)?;
+        let rtxn = self.env.read_txn()?;
+        let mut progresses = std::collections::HashMap::new();
+        for entry in data.iter(&rtxn)? {
+            let (id, episode) = entry?;
+            progresses.insert(id, episode);
+        }
+        Ok(progresses)
+    }
+
     pub fn scrobble(&self, id: u64, episode: u64) -> heed::Result<()> {
         let mut wtxn = self.env.write_txn()?;
         let data = self.data(Some(&mut wtxn))?;

@@ -126,6 +126,10 @@ cached covers.
   optional dependencies only, so `--no-default-features` builds the CLI alone.
 - [x] Bare invocation defaults to `tui` when the feature is on.
 - [x] TUI unit tests run under the default `cargo test`.
+- [x] Account info: read the CLI's stored login, authenticate the detail query,
+  show the viewer's status, score, progress, rewatch count and notes on the
+  media page. Local pending progress wins over a lower AniList value. Read-only,
+  no rows when logged out.
 - [x] README, architecture, agent rules and API notes live in this repository.
 
 ## Later, explicitly out of scope

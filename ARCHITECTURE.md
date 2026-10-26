@@ -9,8 +9,7 @@ One binary, two front ends over the same AniList account:
   given. `--no-default-features` builds the CLI alone.
 
 The CLI is blocking and single-threaded. The TUI is async and input-first. They
-share the crate, not runtime state: the TUI does not read the database and needs
-no login.
+share the crate and the stored login: the TUI reads the token once, read-only.
 
 ## CLI
 
@@ -57,8 +56,26 @@ Responsiveness first. User input has absolute priority over network work. A
 request that is no longer useful is cancelled, not awaited and discarded later
 only.
 
-Non-goals for the TUI: authentication, persistence of the catalog, background
-sync. The CLI owns the account data.
+Non-goals for the TUI: login UI, list mutations, persistence of the catalog,
+background sync. The TUI reads the stored login once, read-only.
+
+### Account data
+
+At startup the TUI opens the CLI's database and reads the stored login and the
+local episode for every media, if any. The token never leaves the process and is
+attached only to the GraphQL client: covers use a second, token-free
+`reqwest::Client` so the CDN never sees it. Failure to open the database or to
+find a login is not an error; the TUI runs as an anonymous viewer.
+
+The media page detail query asks for `mediaListEntry { status score progress
+repeat notes }`. When AniList returns an entry and at least one field is
+meaningful, the sidebar shows it right under the cover: `My Status`, `My Score`,
+`Progress`, `Rewatched`, `Notes`. `Progress` is `max(local episode, remote
+progress)`: a pending local scrobble is the truth even when AniList has not been
+synced yet. The value is `progress / episodes` when the episode count is known.
+Without any list entry, a local episode still produces a `Progress` row. Logged
+out with no local episode, no rows are added. Nothing is cached across pages
+beyond the detail response itself, and the TUI never writes the database.
 
 ### Execution model
 
@@ -287,7 +304,7 @@ never change the selected media.
 | `src/api.rs` | blocking AniList GraphQL client (`ureq`), auth header, progress mutation |
 | `src/database.rs` | LMDB storage, login, episode map, pending queue, `SyncContext` |
 | `src/daemon.rs` | unix double-fork detach for background sync |
-| `src/tui/mod.rs` | TUI entry, tokio runtime, event loop, `select!`, picker |
+| `src/tui/mod.rs` | TUI entry, stored-login lookup, tokio runtime, event loop, `select!`, picker |
 | `src/tui/term.rs` | terminal init/restore, mouse capture, panic hook |
 | `src/tui/app.rs` | UI state, input handling, message handling, debounce, cache |
 | `src/tui/model.rs` | `Media`, `Title`, `CoverImage` |
@@ -309,7 +326,8 @@ never change the selected media.
    `Net::cancel_all` on retirement. No detached task without a token.
 4. A render pass never mutates cancellation state. It may only enqueue requests.
 5. Stale messages are dropped silently, never rendered as errors.
-6. The TUI never reads the database. Account state belongs to the CLI.
+6. The TUI only reads the stored login and local progress at startup; it never
+   writes account state.
 
 ## Testing
 

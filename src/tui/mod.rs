@@ -4,6 +4,7 @@ mod net;
 mod term;
 mod ui;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,8 @@ pub async fn run() -> Result<()> {
     // the terminal in its normal state: do it before entering raw mode.
     let picker = Arc::new(build_picker());
     let (tx, mut rx) = mpsc::channel::<NetMsg>(64);
-    let mut app = App::new(picker, tx);
+    let (token, progress) = stored_account();
+    let mut app = App::with_account(picker, tx, token, progress);
 
     let mut terminal = term::init();
     let mut events = EventStream::new();
@@ -72,6 +74,23 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+fn stored_account() -> (Option<String>, HashMap<i64, i64>) {
+    let Some(db) = crate::database::Database::new().ok() else {
+        return (None, HashMap::new());
+    };
+    let token = db.login().ok().flatten().map(|user| user.token);
+    let progress = db
+        .progresses()
+        .map(|progress| {
+            progress
+                .into_iter()
+                .map(|(id, episode)| (id as i64, episode as i64))
+                .collect()
+        })
+        .unwrap_or_default();
+    (token, progress)
 }
 
 fn build_picker() -> Picker {

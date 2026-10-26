@@ -86,10 +86,27 @@ pub struct Title {
 #[derive(Debug, Clone, Default)]
 pub struct MediaDetail {
     pub media: Media,
+    /// Viewer's list entry for this media, `None` when logged out or not on the list.
+    pub list_entry: Option<MediaListEntry>,
     pub relations: Vec<Relation>,
     pub recommendations: Vec<Media>,
     pub characters: Vec<Credit>,
     pub staff: Vec<Credit>,
+}
+
+/// The viewer's AniList list entry for one media.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaListEntry {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub progress: Option<i64>,
+    #[serde(default)]
+    pub repeat: Option<i64>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 /// Which credit list a request targets.

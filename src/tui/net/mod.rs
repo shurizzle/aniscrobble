@@ -130,7 +130,10 @@ pub enum NetMsg {
 
 /// Shared, immutable dependencies of every worker task.
 struct Runner {
+    /// GraphQL client. Carries the stored login token when there is one.
     client: reqwest::Client,
+    /// Image client. Never sends the token to the AniList CDN.
+    images: reqwest::Client,
     picker: Arc<Picker>,
     gql: Semaphore,
     covers: Semaphore,
@@ -148,15 +151,39 @@ pub struct Net {
 }
 
 impl Net {
+    #[cfg(test)]
     pub fn new(picker: Arc<Picker>, tx: mpsc::Sender<NetMsg>) -> Self {
+        Self::with_token(picker, tx, None)
+    }
+
+    pub fn with_token(
+        picker: Arc<Picker>,
+        tx: mpsc::Sender<NetMsg>,
+        token: Option<String>,
+    ) -> Self {
+        let build = || {
+            reqwest::Client::builder()
+                .user_agent(graphql::USER_AGENT)
+                .build()
+                .expect("reqwest client")
+        };
+        let images = build();
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = token.as_deref()
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         let client = reqwest::Client::builder()
             .user_agent(graphql::USER_AGENT)
+            .default_headers(headers)
             .build()
             .expect("reqwest client");
 
         Self {
             runner: Arc::new(Runner {
                 client,
+                images,
                 picker,
                 gql: Semaphore::new(4),
                 covers: Semaphore::new(3),
@@ -409,7 +436,7 @@ async fn run(runner: &Runner, scope: ScopeId, req: u64, job: Job) -> Result<NetM
             let bytes = {
                 let _permit = runner.covers.acquire().await?;
                 runner
-                    .client
+                    .images
                     .get(&url)
                     .header(reqwest::header::USER_AGENT, graphql::USER_AGENT)
                     .send()
