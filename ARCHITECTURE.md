@@ -125,6 +125,14 @@ type-aware (`anime:<id>` / `manga:<id>`), the credit tabs pass the same type,
 and the sidebar shows chapters/volumes instead of episodes for manga. This also
 makes a relation or recommendation opened from a manga page query manga again.
 
+### External pages
+
+`o` resolves the current context to an AniList URL and hands it to
+`open::that_detached`: person page first (`staff` / `character`), then the open
+media page, then the selected list row. The URL uses the media `type`, so manga
+open under `/manga/`. Failures are shown in the footer. Search input keeps `o`
+as text; the key does not act while the field has focus.
+
 ### Disk cache
 
 `src/tui/cache.rs` persists every fetch except search in the CLI's LMDB

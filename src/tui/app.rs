@@ -705,6 +705,33 @@ impl App {
         *target = (*target as i64 + delta).max(0) as u16;
     }
 
+    /// AniList URL of what the user is looking at, if anything.
+    fn external_url(&self) -> Option<String> {
+        if let Some(view) = &self.person_view {
+            let data = view.data.as_ref()?;
+            return Some(format!(
+                "https://anilist.co/{}/{}",
+                data.kind.url_path(),
+                data.id
+            ));
+        }
+        if self.detail {
+            return self.page_media().map(|media| media.anilist_url());
+        }
+        self.selected_item().map(Media::anilist_url)
+    }
+
+    /// Open the current media or person page in the system browser.
+    fn open_external(&mut self) {
+        let Some(url) = self.external_url() else {
+            return;
+        };
+        if let Err(err) = open::that_detached(&url) {
+            self.error = Some(format!("cannot open browser: {err}"));
+            self.dirty = true;
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -751,6 +778,7 @@ impl App {
             KeyCode::Char('n') => self.move_person_cursor(1),
             KeyCode::Char('p') => self.move_person_cursor(-1),
             KeyCode::Enter => self.activate_person_link(),
+            KeyCode::Char('o') => self.open_external(),
             _ => {}
         }
     }
@@ -850,6 +878,7 @@ impl App {
             KeyCode::Tab => self.toggle_source(),
             KeyCode::Char('r') => self.refetch(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_mine(),
+            KeyCode::Char('o') => self.open_external(),
             KeyCode::Backspace => self.back_from_browse(),
             _ => {}
         }
@@ -883,6 +912,7 @@ impl App {
             KeyCode::Char('1') => self.switch_tab(PageTab::Overview),
             KeyCode::Char('2') => self.switch_tab(PageTab::Characters),
             KeyCode::Char('3') => self.switch_tab(PageTab::Staff),
+            KeyCode::Char('o') => self.open_external(),
             _ => {}
         }
     }
@@ -1605,6 +1635,49 @@ mod tests {
             id,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn o_resolves_the_anilist_page_for_every_screen() {
+        use crate::tui::model::{PersonKind, PersonPageData};
+
+        let mut app = app();
+        let mut anime = media(1);
+        anime.kind = MediaKind::Anime;
+        app.items = vec![anime.clone()];
+        assert_eq!(
+            app.external_url().as_deref(),
+            Some("https://anilist.co/anime/1")
+        );
+
+        let mut manga = media(2);
+        manga.kind = MediaKind::Manga;
+        app.items = vec![manga.clone()];
+        assert_eq!(
+            app.external_url().as_deref(),
+            Some("https://anilist.co/manga/2")
+        );
+
+        app.detail = true;
+        app.page_subject = Some(anime);
+        assert_eq!(
+            app.external_url().as_deref(),
+            Some("https://anilist.co/anime/1")
+        );
+
+        app.detail = false;
+        app.person_view = Some(super::PersonView {
+            data: Some(PersonPageData {
+                kind: PersonKind::Staff,
+                id: 9,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.external_url().as_deref(),
+            Some("https://anilist.co/staff/9")
+        );
     }
 
     #[tokio::test]

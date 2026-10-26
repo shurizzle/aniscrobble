@@ -85,6 +85,13 @@ Both sections paginate independently, 30 rows per page, infinite scroll, and
 keep the selected row when a page is appended. Opening a row works for anime
 and manga, including detail, characters/staff tabs and cover cache.
 
+### External page
+
+`o` opens what you are looking at on `anilist.co` in the system browser: the
+selected list row, the open media page, or the open staff/character page. URLs
+are `anilist.co/anime/<id>`, `/manga/<id>`, `/staff/<id>` or `/character/<id>`.
+While typing in the search field, `o` is a normal character.
+
 ### Cache
 
 Every successful GraphQL response except search, plus every cover image, is
@@ -129,6 +136,7 @@ Media page, with cover, metadata, tags, relations and character thumbnails:
 | `/` | Focus search input |
 | `Tab` | List: toggle trending / search results. Media page: switch sidebar/content |
 | `r` | Reload current view |
+| `o` | Open the current media or person page on AniList in the browser |
 | `Backspace` | List: return to the media page a genre/tag was opened from |
 | `Esc` | Leave search input, close the media page |
 | `q` / `Ctrl-C` | Quit |

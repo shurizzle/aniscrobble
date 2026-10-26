@@ -74,6 +74,15 @@ pub enum MediaKind {
     Manga,
 }
 
+impl PersonKind {
+    pub fn url_path(self) -> &'static str {
+        match self {
+            PersonKind::Staff => "staff",
+            PersonKind::Character => "character",
+        }
+    }
+}
+
 impl MediaKind {
     pub fn label(self) -> &'static str {
         match self {
@@ -108,6 +117,10 @@ impl Media {
 
     pub fn cover_url(&self) -> Option<&str> {
         self.cover_image.large.as_deref()
+    }
+
+    pub fn anilist_url(&self) -> String {
+        format!("https://anilist.co/{}/{}", self.kind.label(), self.id)
     }
 
     /// Higher resolution variant for the media page.

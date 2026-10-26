@@ -51,7 +51,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let page_id = data.as_ref().map(|data| data.id).unwrap_or(0);
     let url = data
         .as_ref()
-        .map(|data| data.kind_url_path())
+        .map(|data| data.kind.url_path())
         .unwrap_or("staff");
     draw_top_bar(f, url, page_id, top);
 
@@ -320,7 +320,7 @@ fn draw_portrait(f: &mut Frame, app: &mut App, data: Option<&PersonPageData>, ar
         f.render_widget(Paragraph::new(dim("···")), area);
         return;
     };
-    let key = format!("{}:{}:portrait", data.kind_url_path(), data.id);
+    let key = format!("{}:{}:portrait", data.kind.url_path(), data.id);
 
     match app.cover(&key, url, STAFF_PORTRAIT.0, STAFF_PORTRAIT.1) {
         Some(proto) => {
@@ -393,15 +393,6 @@ fn draw_top_bar(f: &mut Frame, path: &str, id: i64, area: Rect) {
         dim(format!("  anilist.co/{path}/{id}")),
     ]);
     f.render_widget(Paragraph::new(left), area);
-}
-
-impl PersonPageData {
-    fn kind_url_path(&self) -> &'static str {
-        match self.kind {
-            crate::tui::model::PersonKind::Staff => "staff",
-            crate::tui::model::PersonKind::Character => "character",
-        }
-    }
 }
 
 #[cfg(test)]

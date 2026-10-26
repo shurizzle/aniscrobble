@@ -130,6 +130,8 @@ cached covers.
   with `progress / total`, a `+N new` badge for available episodes/chapters,
   independent pagination, local progress winning for anime, and type-aware
   detail pages. Network-first, cached as offline fallback, read-only.
+- [x] `o` opens the current media, anime/manga, staff or character page on
+  anilist.co in the system browser.
 - [x] Account info: read the CLI's stored login, authenticate the detail query,
   show the viewer's status, score, progress, rewatch count and notes on the
   media page. Local pending progress wins over a lower AniList value. Read-only,
