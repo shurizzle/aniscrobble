@@ -53,6 +53,21 @@ double `fork` + `setsid` + stdio on `/dev/null` on unix, a `sync` child with
 
 ## TUI
 
+### Config
+
+`src/config.rs` reads `config.toml` from `dirs::config_dir()` /
+`aniscrobble/config.toml`. A missing file is not an error (defaults apply); an
+invalid file is reported once in the footer and the defaults apply. Only one key
+exists today:
+
+```toml
+[external]
+command = "/path/to/bin"
+```
+
+The value is a plain path, not a shell string: the binary is run directly with
+two arguments, `anime|manga` and the id. Nothing is parsed or interpolated.
+
 ### Goal
 
 Responsiveness first. User input has absolute priority over network work. A
@@ -132,6 +147,30 @@ makes a relation or recommendation opened from a manga page query manga again.
 media page, then the selected list row. The URL uses the media `type`, so manga
 open under `/manga/`. Failures are shown in the footer. Search input keeps `o`
 as text; the key does not act while the field has focus.
+
+### External command
+
+`e` does not spawn the child inside the key handler. `App::run_external` only
+records `pending_external: (MediaKind, i64)`; the event loop sees it, returns
+`Outcome::External`, and leaves the loop. `tui::run` then, in order:
+
+1. drops the `EventStream`, whose reader thread would otherwise steal the
+   child's stdin;
+2. `term::suspend()` disables mouse capture, leaves raw mode and the alternate
+   screen;
+3. runs the configured binary through `spawn_blocking` with inherited stdio,
+   `anime|manga` and the id as arguments; a non-zero status or a spawn failure
+   prints the reason plus `Press ENTER to continue` and blocks on stdin, so the
+   output stays readable before the screen is restored;
+4. `term::resume()` re-enters raw mode and the alternate screen, installs a new
+   `EventStream`, and marks the app dirty.
+
+The app state is untouched across the suspension, so the same scroll, selection
+and scope stay live. A non-zero status or spawn failure is also written to the
+footer after the resume.
+The target is the selected list row or the open media page; the person page
+returns `None`, and a missing `[external] command` is ignored with a footer
+message. Search input keeps `e` as text.
 
 ### Disk cache
 
@@ -419,6 +458,7 @@ never change the selected media.
 | `src/main.rs` | CLI parsing, command dispatch, sync loop, login |
 | `src/api.rs` | blocking AniList GraphQL client (`ureq`), auth header, progress mutation |
 | `src/database.rs` | LMDB storage, login, episode map, pending queue, TUI cache database, `SyncContext` |
+| `src/config.rs` | TOML config from the platform config dir (TUI only) |
 | `src/daemon.rs` | unix double-fork detach for background sync |
 | `src/tui/mod.rs` | TUI entry, stored-login lookup, tokio runtime, event loop, `select!`, picker |
 | `src/tui/cache.rs` | persistent GraphQL response and cover cache |
@@ -452,10 +492,11 @@ never change the selected media.
 
 - Unit: scope bookkeeping (`request` supersedes, `retire` cancels and aborts,
   unknown scope ignored), stale `req_id` rejection, token bucket refill,
-  rendering helpers, key/mouse routing, and the CLI defaulting to `tui` on a
-  bare invocation.
+  rendering helpers, key/mouse routing, config parsing, the `e` target, and the
+  CLI defaulting to `tui` on a bare invocation.
 - Manual: latency under load, cancellation behaviour while spamming `j`, search
-  typing, terminal resize, half-blocks fallback.
+  typing, terminal resize, half-blocks fallback, and the external command
+  suspension (terminal handed to the child and restored afterwards).
 - CLI: no automated coverage. Database behaviour is checked manually with
   `scrobble --local-only` followed by `sync`.
 

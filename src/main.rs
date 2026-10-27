@@ -5,6 +5,8 @@ use database::{Database, User};
 use rustyline::{DefaultEditor, error::ReadlineError};
 
 mod api;
+#[cfg(feature = "tui")]
+mod config;
 #[cfg(not(windows))]
 mod daemon;
 mod database;

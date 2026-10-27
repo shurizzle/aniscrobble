@@ -92,6 +92,21 @@ selected list row, the open media page, or the open staff/character page. URLs
 are `anilist.co/anime/<id>`, `/manga/<id>`, `/staff/<id>` or `/character/<id>`.
 While typing in the search field, `o` is a normal character.
 
+### External command
+
+`e` suspends the TUI and runs the binary configured in `config.toml`, passing
+the media type and the AniList id as its two arguments: `anime|manga` first, the
+id second. The terminal is handed over completely: raw mode and the alternate
+screen are released, so the script owns stdin, stdout and stderr. When it exits,
+the TUI is restored exactly where it was, with no refetch and no lost scroll.
+
+The command acts on the selected list row or the open media page. A person page
+has no media of its own, so `e` does nothing there. While typing in the search
+field, `e` is a normal character. With no command configured the footer says so.
+A non-zero exit status is shown in the footer too, and before the TUI comes back
+it waits with `Press ENTER to continue`, so the script's error output stays on
+screen.
+
 ### Cache
 
 Every successful GraphQL response except search, plus every cover image, is
@@ -137,6 +152,7 @@ Media page, with cover, metadata, tags, relations and character thumbnails:
 | `Tab` | List: toggle trending / search results. Media page: switch sidebar/content |
 | `r` | Reload current view |
 | `o` | Open the current media or person page on AniList in the browser |
+| `e` | Run the configured external command for the current media |
 | `Backspace` | List: return to the media page a genre/tag was opened from |
 | `Esc` | Leave search input, close the media page |
 | `q` / `Ctrl-C` | Quit |
@@ -195,6 +211,19 @@ them, and when shown they are red. `Esc`/`Backspace` walks back one page, then
 returns to the list.
 
 ### Configuration
+
+Settings live in TOML at `aniscrobble/config.toml` inside the platform config
+directory (`~/.config` on Linux, `~/Library/Application Support` on macOS,
+`%APPDATA%` on Windows):
+
+```toml
+[external]
+# Called on `e` with two arguments: the media type and the AniList id.
+command = "/home/me/bin/notify"
+```
+
+A missing file means defaults. An invalid file is reported in the footer and the
+defaults apply.
 
 | Variable | Values | Effect |
 | --- | --- | --- |

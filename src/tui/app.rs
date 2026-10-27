@@ -220,6 +220,11 @@ pub struct App {
     pub spinner: u8,
     pub protocol: String,
 
+    /// Binary called on `e`, from the config file.
+    pub external_command: Option<std::path::PathBuf>,
+    /// Set by `e`: the main loop suspends the TUI, runs the command and
+    /// resumes where it left off.
+    pub pending_external: Option<(MediaKind, i64)>,
     covers: HashMap<CoverKey, Arc<Protocol>>,
     pending_covers: HashSet<CoverKey>,
     failed_covers: HashSet<CoverKey>,
@@ -295,6 +300,8 @@ impl App {
             error: None,
             spinner: 0,
             protocol,
+            external_command: None,
+            pending_external: None,
             covers: HashMap::new(),
             pending_covers: HashSet::new(),
             failed_covers: HashSet::new(),
@@ -732,6 +739,33 @@ impl App {
         }
     }
 
+    /// The media the external command acts on. The person page has no media
+    /// of its own, so `e` is ignored there.
+    fn external_target(&self) -> Option<(MediaKind, i64)> {
+        if self.person_view.is_some() {
+            return None;
+        }
+        let media = if self.detail {
+            self.page_media()?
+        } else {
+            self.selected_item()?.clone()
+        };
+        Some((media.kind, media.id))
+    }
+
+    /// Ask the main loop to suspend the TUI and run the configured command.
+    /// The command must not run here: it would block on the raw terminal.
+    fn run_external(&mut self) {
+        let Some(target) = self.external_target() else {
+            return;
+        };
+        if self.external_command.is_none() {
+            self.error = Some("no external command configured".into());
+            return;
+        }
+        self.pending_external = Some(target);
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -879,6 +913,7 @@ impl App {
             KeyCode::Char('r') => self.refetch(),
             KeyCode::Char('m') | KeyCode::Char('M') => self.open_mine(),
             KeyCode::Char('o') => self.open_external(),
+            KeyCode::Char('e') => self.run_external(),
             KeyCode::Backspace => self.back_from_browse(),
             _ => {}
         }
@@ -913,6 +948,7 @@ impl App {
             KeyCode::Char('2') => self.switch_tab(PageTab::Characters),
             KeyCode::Char('3') => self.switch_tab(PageTab::Staff),
             KeyCode::Char('o') => self.open_external(),
+            KeyCode::Char('e') => self.run_external(),
             _ => {}
         }
     }
@@ -1678,6 +1714,35 @@ mod tests {
             app.external_url().as_deref(),
             Some("https://anilist.co/staff/9")
         );
+    }
+
+    #[tokio::test]
+    async fn e_queues_the_external_command_for_the_selected_media() {
+        let mut app = app();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut manga = media(7);
+        manga.kind = MediaKind::Manga;
+        app.items = vec![manga];
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.pending_external.is_none());
+        assert_eq!(app.error.as_deref(), Some("no external command configured"));
+
+        app.external_command = Some("/bin/notify".into());
+
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(app.pending_external, Some((MediaKind::Manga, 7)));
+
+        app.pending_external = None;
+        app.detail = true;
+        app.page_subject = Some(media(3));
+        app.on_key(key(KeyCode::Char('e')));
+        assert_eq!(app.pending_external, Some((MediaKind::Anime, 3)));
+
+        app.pending_external = None;
+        app.person_view = Some(super::PersonView::default());
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.pending_external.is_none());
     }
 
     #[tokio::test]

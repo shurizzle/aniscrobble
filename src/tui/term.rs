@@ -25,3 +25,17 @@ pub fn restore() {
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
 }
+
+/// Leave raw mode and the alternate screen so a child process owns the
+/// terminal. Mouse capture is disabled with them.
+pub fn suspend() {
+    let _ = execute!(stdout(), DisableMouseCapture);
+    ratatui::restore();
+}
+
+/// Re-enter raw mode and the alternate screen after [`suspend`].
+pub fn resume() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = execute!(stdout(), EnableMouseCapture);
+    terminal
+}
